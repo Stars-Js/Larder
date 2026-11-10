@@ -1,0 +1,34 @@
+run:
+  tests: true
+  relative-path-mode: gomod
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gocognit
+    - bodyclose
+    - errorlint
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  gocognit:
+    min-complexity: 20
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocognit
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

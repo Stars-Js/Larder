@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Larder">
+  <defs>
+    <linearGradient id="bg" x1="12" y1="8" x2="116" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a291d8"/>
+      <stop offset="0.52" stop-color="#8b78c8"/>
+      <stop offset="1" stop-color="#6c5aa9"/>
+    </linearGradient>
+    <linearGradient id="sheet" x1="64" y1="28" x2="64" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f5f2ff"/>
+    </linearGradient>
+    <linearGradient id="backA" x1="30" y1="22" x2="98" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#c7b9ee"/>
+      <stop offset="1" stop-color="#a996dd"/>
+    </linearGradient>
+    <linearGradient id="backB" x1="34" y1="20" x2="106" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#dcecfd"/>
+      <stop offset="1" stop-color="#b9d6f5"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="78" y1="28" x2="98" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e3f0fd"/>
+      <stop offset="1" stop-color="#c4ddf7"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="34" cy="22" r="82" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-24%" y="-24%" width="148%" height="148%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4.5" flood-color="#382b57" flood-opacity=".28"/>
+    </filter>
+    <filter id="line" x="-20%" y="-40%" width="140%" height="180%">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#382b57" flood-opacity=".18"/>
+    </filter>
+  </defs>
+
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <rect x="1.4" y="1.4" width="125.2" height="125.2" rx="26.8" fill="none" stroke="#ffffff" stroke-opacity=".34" stroke-width="1.2"/>
+  <rect width="128" height="128" rx="28" fill="url(#glow)"/>
+
+  <g filter="url(#soft)">
+    <rect x="25" y="24" width="62" height="80" rx="10" fill="url(#backA)" transform="rotate(-7 56 64)"/>
+    <rect x="39" y="21" width="63" height="81" rx="10" fill="url(#backB)" transform="rotate(5 70 61)"/>
+  </g>
+
+  <path d="M43 26h39.5a9 9 0 0 1 6.4 2.7l12.4 12.4a9 9 0 0 1 2.7 6.4V104a9 9 0 0 1-9 9H43a9 9 0 0 1-9-9V35a9 9 0 0 1 9-9z" fill="url(#sheet)" filter="url(#soft)"/>
+  <path d="M84 27.2 102 45.2h-9a9 9 0 0 1-9-9z" fill="url(#fold)"/>
+  <path d="M84 27.2V45.2h18" fill="none" stroke="#a9c8ec" stroke-width="1.1" stroke-linejoin="round"/>
+
+  <rect x="47" y="48" width="22" height="22" rx="5.5" fill="#f7c84b" filter="url(#line)"/>
+  <rect x="47" y="49" width="22" height="10" rx="5.5" fill="#ffdd7a" opacity=".55"/>
+
+  <g filter="url(#line)">
+    <rect x="47" y="80" width="46" height="6.4" rx="3.2" fill="#4b90e2"/>
+    <rect x="47" y="92" width="38" height="6.4" rx="3.2" fill="#83bbef"/>
+    <rect x="47" y="104" width="21" height="6.4" rx="3.2" fill="#4b90e2"/>
+    <rect x="72" y="104" width="21" height="6.4" rx="3.2" fill="#b7a6e6"/>
+  </g>
+</svg>

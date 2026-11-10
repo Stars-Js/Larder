@@ -1,0 +1,35 @@
+# 忽略构建产物与本地依赖
+/bin/
+/dist/
+/release/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# 本地数据文件
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# 本地环境与密钥
+.env
+.env.local
+*.local
+configs/*.local.yaml
+
+# IDE / 系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 临时测试目录
+/.tmp_*/
+/.smoke*/

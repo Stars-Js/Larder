@@ -1,0 +1,103 @@
+# Larder 示例配置。
+#
+# 程序优先读取 exe 同级的 larder.toml；首次运行会自动生成一份带默认值的配置。
+# 也可以把本文件复制到 exe 同级并修改。优先级：默认值 < TOML < 环境变量。
+#
+# 三个外部服务均通过 API 接入：
+#   - 解析：plain（内置）或 mineru / docling / tika（外部 OCR/版面解析）
+#   - 向量：任意 OpenAI 兼容 /v1/embeddings
+#   - 重排：任意 OpenAI 兼容 /v1/rerank（可选）
+#
+# 密钥建议写成 ${ENV_NAME} 引用环境变量，避免明文落盘。
+# 界面「设置」只需要填 API 地址与密钥，修改后自动保存；
+# 下面的 model / path / timeout / dim 等是高级字段，可按需在这里调整。
+
+
+[server]
+addr = '127.0.0.1:8765'
+mcp_path = '/mcp'
+mcp_enabled = true
+read_timeout = '5m'
+write_timeout = '30m'
+idle_timeout = '2m'
+shutdown_timeout = '10s'
+
+[storage]
+# 每个知识库是 dir 下的一个 <id>.db；相对路径相对于 exe 所在目录。
+dir = 'data'
+
+[chunk]
+max_runes = 1200
+overlap = 150
+min_runes = 80
+
+[search]
+top_k = 8
+candidate_k = 40
+max_top_k = 50
+max_candidates = 200
+
+# ---- 解析服务 ----
+# plain：内置解析（Markdown/文本/代码/文字版 PDF/DOCX/PPTX/XLSX/EPUB/HTML）。
+# mineru/docling/tika：本地能解析的格式仍本地处理，扫描件/矢量 PDF 自动走外部 API。
+[parse]
+enabled = true
+provider = 'plain'
+
+[parse.endpoint]
+# 多密钥：也可写 api_keys = ['sk-当前', 'sk-备用']，第一个为当前使用。
+base_url = ''
+api_key = ''
+model = ''
+path = ''
+timeout = '2m0s'
+max_retries = 5
+qps = 0.0
+
+# ---- 向量化服务 ----
+[embed]
+enabled = true
+provider = 'openai'
+dim = 0 # 0 = 使用服务实际返回的维度
+
+[embed.endpoint]
+base_url = 'https://api.siliconflow.cn'
+api_key = '${LARDER_EMBED_API_KEY}'
+model = 'BAAI/bge-m3'
+path = '/v1/embeddings'
+timeout = '1m0s'
+max_retries = 3
+qps = 8.0
+
+# ---- 重排服务（可选） ----
+[rerank]
+enabled = false
+provider = 'openai'
+
+[rerank.endpoint]
+base_url = 'https://api.siliconflow.cn'
+api_key = '${LARDER_RERANK_API_KEY}'
+model = 'BAAI/bge-reranker-v2-m3'
+path = '/v1/rerank'
+timeout = '30s'
+max_retries = 2
+qps = 8.0
+
+# ---- 引用格式 ----
+# 设置页「引用格式」修改后会自动写回；未列出的平台会自动补默认值。
+# mode: markdown（悬浮链接）/ plain（纯文本）
+# fields: cite/log/doc/file/heading/text；cite 始终第一位，log 勾选后固定第二位。
+[citation]
+version = 2
+
+[citation.profiles.default]
+mode = 'markdown'
+fields = ['cite', 'log', 'doc', 'file', 'text']
+
+[citation.profiles.zcode]
+mode = 'plain'
+fields = ['cite', 'log', 'doc', 'file', 'heading', 'text']
+
+[log]
+level = 'info'
+format = 'text'
