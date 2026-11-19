@@ -33,9 +33,13 @@ func Open(path string) (*SQLite, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
-	// 单文件库，串行写入足够，避免并发写锁。
+	// 单文件库仍保持单连接，避免多写者互相锁；WAL 让读写更平滑，
+	// busy_timeout 防止同步与检索并发时立刻报 database is locked。
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(0)
+	_, _ = db.Exec(`pragma journal_mode = wal`)
+	_, _ = db.Exec(`pragma synchronous = normal`)
+	_, _ = db.Exec(`pragma busy_timeout = 5000`)
 
 	s := &SQLite{db: db}
 	if err := s.migrate(); err != nil {
@@ -93,6 +97,36 @@ func (s *SQLite) migrate() error {
 			chars integer not null default 0,
 			status text not null default 'ok')`,
 		`create index if not exists idx_usage_ts on usage_events(ts)`,
+		`create table if not exists library_items(
+			item_key text primary key,
+			library_id text not null default '',
+			collection_key text not null default '',
+			item_type text not null default '',
+			title text not null default '',
+			year integer not null default 0,
+			date text not null default '',
+			doi text not null default '',
+			url text not null default '',
+			authors text not null default '[]',
+			journal text not null default '',
+			volume text not null default '',
+			issue text not null default '',
+			pages text not null default '',
+			publisher text not null default '',
+			language text not null default '',
+			abstract text not null default '',
+			cite_key text not null default '',
+			bibtex text not null default '',
+			attachment_key text not null default '',
+			attachment_path text not null default '',
+			fulltext_source text not null default '',
+			item_version integer not null default 0,
+			date_modified text not null default '',
+			doc_id text not null default '',
+			sync_status text not null default '',
+			sync_note text not null default '',
+			updated_at text not null default '')`,
+		`create index if not exists idx_library_items_doc on library_items(doc_id)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
@@ -501,6 +535,34 @@ func (s *SQLite) CountChunks(ctx context.Context, docID string) (int, error) {
 		err = s.db.QueryRowContext(ctx, `select count(*) from chunks where doc_id = ?`, docID).Scan(&n)
 	}
 	return n, err
+}
+
+// Stats 用一次聚合查询返回文档总数、解析/嵌入/失败/待处理数量。
+func (s *SQLite) Stats(ctx context.Context) (DocStats, error) {
+	var st DocStats
+	var bothOK int
+	var created sql.NullString
+	err := s.db.QueryRowContext(ctx, `select
+			count(*),
+			coalesce(sum(case when parse_status = 'ok' then 1 else 0 end), 0),
+			coalesce(sum(case when embed_status = 'ok' then 1 else 0 end), 0),
+			coalesce(sum(case when parse_status = 'error' or embed_status = 'error' then 1 else 0 end), 0),
+			coalesce(sum(case when parse_status = 'ok' and embed_status = 'ok' then 1 else 0 end), 0),
+			min(created_at)
+		from documents`).Scan(&st.Total, &st.Parsed, &st.Embedded, &st.Failed, &bothOK, &created)
+	if err != nil {
+		return DocStats{}, err
+	}
+	st.Pending = st.Total - st.Failed - bothOK
+	if st.Pending < 0 {
+		st.Pending = 0
+	}
+	if created.Valid {
+		if t, err := time.Parse(time.RFC3339, created.String); err == nil {
+			st.CreatedAt = t
+		}
+	}
+	return st, nil
 }
 
 // AddUsage 追加一条用量记录。

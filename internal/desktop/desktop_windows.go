@@ -60,7 +60,8 @@ func Run(title, url string, width, height int) error {
 	setWindowBackground(hwnd)
 	setWindowIcon(hwnd)
 	installTray(hwnd)
-	tintTitleBar(hwnd)
+	registerWindow(hwnd, isDarkMode())
+	defer unregisterWindow(hwnd)
 
 	w.Navigate(url)
 
@@ -68,7 +69,7 @@ func Run(title, url string, width, height int) error {
 	go func() {
 		time.Sleep(350 * time.Millisecond)
 		w.Dispatch(func() {
-			tintTitleBar(uintptr(w.Window()))
+			refreshWindowTheme(uintptr(w.Window()))
 			forceForeground(uintptr(w.Window()))
 		})
 	}()

@@ -38,6 +38,39 @@ type Chunk struct {
 	Text    string `json:"text"`
 }
 
+// LibraryItem 是从 Zotero 同步到某个知识库的文献条目。
+// 它保存引用所需的元数据，以及到 documents / 附件 / Zotero 深链的映射。
+type LibraryItem struct {
+	ItemKey        string    `json:"item_key"`
+	LibraryID      string    `json:"library_id,omitempty"`
+	CollectionKey  string    `json:"collection_key,omitempty"`
+	ItemType       string    `json:"item_type,omitempty"`
+	Title          string    `json:"title"`
+	Year           int       `json:"year,omitempty"`
+	Date           string    `json:"date,omitempty"`
+	DOI            string    `json:"doi,omitempty"`
+	URL            string    `json:"url,omitempty"`
+	Authors        []string  `json:"authors,omitempty"`
+	Journal        string    `json:"journal,omitempty"`
+	Volume         string    `json:"volume,omitempty"`
+	Issue          string    `json:"issue,omitempty"`
+	Pages          string    `json:"pages,omitempty"`
+	Publisher      string    `json:"publisher,omitempty"`
+	Language       string    `json:"language,omitempty"`
+	Abstract       string    `json:"abstract,omitempty"`
+	CiteKey        string    `json:"cite_key,omitempty"`
+	BibTeX         string    `json:"bibtex,omitempty"`
+	AttachmentKey  string    `json:"attachment_key,omitempty"`
+	AttachmentPath string    `json:"attachment_path,omitempty"`
+	FulltextSource string    `json:"fulltext_source,omitempty"`
+	ItemVersion    int       `json:"item_version,omitempty"`
+	DateModified   string    `json:"date_modified,omitempty"`
+	DocID          string    `json:"doc_id,omitempty"`
+	SyncStatus     string    `json:"sync_status,omitempty"`
+	SyncNote       string    `json:"sync_note,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+}
+
 // SearchHit 是检索结果，带引用信息与两段得分。
 type SearchHit struct {
 	ChunkID     int64   `json:"chunk_id"`

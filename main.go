@@ -27,6 +27,7 @@ import (
 	"larder/internal/config"
 	"larder/internal/desktop"
 	"larder/internal/kb"
+	"larder/internal/library"
 	"larder/internal/route"
 	"larder/internal/server"
 	"larder/internal/services"
@@ -138,6 +139,7 @@ func run() error {
 	api.MigrateInjectedClients(mcpURL, cfg.Storage.Dir)
 
 	act := activity.New(filepath.Join(cfg.Storage.Dir, "activity.log"))
+	libSvc := library.New(manager, logger)
 	handler := route.Handler(route.Deps{
 		Manager:  manager,
 		MCPPath:  cfg.Server.MCPPath,
@@ -146,6 +148,7 @@ func run() error {
 		API: api.Deps{
 			Manager:    manager,
 			Services:   svc,
+			Library:    libSvc,
 			SaveConfig: saveConfig,
 			ConfigPath: savePath,
 			MCPURL:     mcpURL,
@@ -158,6 +161,9 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Zotero 自动同步：启动时补一次，之后监听 zotero.sqlite/storage 变化。
+	// 监听循环内部会读取当前 watch 开关，界面切换后立即生效，无需重启。
+	go libSvc.Watch(ctx, cfg.Zotero.WatchInterval.Std())
 
 	logger.Info("Larder 就绪",
 		"addr", actualAddr,

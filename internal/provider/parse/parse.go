@@ -13,13 +13,21 @@ type Input struct {
 	Data     []byte
 }
 
+// Image 是解析结果中的一张图片。Markdown 中的图片引用使用 Name。
+type Image struct {
+	Name string
+	Data []byte
+	MIME string
+}
+
 // Result 是解析结果。
 type Result struct {
 	Markdown string // 统一输出 Markdown
 	Title    string // 从内容推断的标题，可能为空
 	MIME     string
-	Method   string // 实际使用的解析器（plain / mineru / docling / tika）
-	Note     string // 解析补充说明（页数、字符数、是否 OCR 等）
+	Method   string  // 实际使用的解析器（plain / mineru / docling / tika）
+	Note     string  // 解析补充说明（页数、字符数、是否 OCR 等）
+	Images   []Image // 解析器抽取的图片，可为空
 }
 
 // Parser 是解析器接口。

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +66,87 @@ type Config struct {
 	Embed    Provider       `toml:"embed"`
 	Rerank   Provider       `toml:"rerank"`
 	Citation CitationConfig `toml:"citation"`
+	Zotero   ZoteroConfig   `toml:"zotero"`
 	Log      LogConfig      `toml:"log"`
+}
+
+// ZoteroConfig 描述 Zotero 文献库联动。
+type ZoteroConfig struct {
+	Enabled       bool     `toml:"enabled" json:"enabled"`               // 是否开启联动
+	DataDir       string   `toml:"data_dir" json:"data_dir"`             // Zotero 数据目录（包含 zotero.sqlite）；留空自动读取 prefs.js
+	APIBase       string   `toml:"api_base" json:"api_base"`             // 本地 API 地址，默认 http://127.0.0.1:23119/api
+	LibraryID     string   `toml:"library_id" json:"library_id"`         // 个人库为 0；群组库填 groupID
+	MDMode        string   `toml:"md_mode" json:"md_mode"`               // storage（PDF 同目录）/ larder（Zotero 数据目录下）/ off
+	ParseMode     string   `toml:"parse_mode" json:"parse_mode"`         // auto（优先版面解析）/ layout（强制版面）/ zotero（只读全文缓存）
+	CiteStyle     string   `toml:"cite_style" json:"cite_style"`         // 默认参考文献样式
+	Watch         bool     `toml:"watch" json:"watch"`                   // 监听 Zotero 数据库变化并自动同步
+	WatchInterval Duration `toml:"watch_interval" json:"watch_interval"` // 变化检测间隔
+}
+
+var zoteroDataDirRE = regexp.MustCompile(`(?m)^\s*user_pref\(\s*"extensions\.zotero\.dataDir"\s*,\s*"((?:\\.|[^"\\])*)"\s*\)\s*;`)
+
+// parseZoteroPrefsFile 从 Zotero 的 prefs.js 读取数据目录。
+func parseZoteroPrefsFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	m := zoteroDataDirRE.FindSubmatch(b)
+	if len(m) != 2 {
+		return ""
+	}
+	s := string(m[1])
+	if u, err := strconv.Unquote(`"` + s + `"`); err == nil {
+		s = u
+	}
+	return strings.TrimSpace(s)
+}
+
+// zoteroPrefsCandidates 返回常见 Zotero profile 下的 prefs.js 路径。
+func zoteroPrefsCandidates() []string {
+	var out []string
+	if cfg, err := os.UserConfigDir(); err == nil {
+		out = append(out,
+			filepath.Join(cfg, "Zotero", "Zotero", "Profiles"),
+			filepath.Join(cfg, "Zotero", "Profiles"),
+		)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		out = append(out,
+			filepath.Join(home, ".zotero", "zotero"),
+			filepath.Join(home, "Library", "Application Support", "Zotero", "Profiles"),
+		)
+	}
+	var files []string
+	for _, dir := range out {
+		matches, _ := filepath.Glob(filepath.Join(dir, "*", "prefs.js"))
+		files = append(files, matches...)
+	}
+	return files
+}
+
+// DefaultZoteroDataDir 优先从 Zotero 设置读取数据目录，读不到再用 ~/Zotero。
+func DefaultZoteroDataDir() string {
+	if v := strings.TrimSpace(os.Getenv("ZOTERO_DATA_DIR")); v != "" {
+		return v
+	}
+	for _, p := range zoteroPrefsCandidates() {
+		if d := parseZoteroPrefsFile(p); d != "" {
+			if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+				return d
+			}
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	// Zotero 在 Windows / macOS / Linux 的默认数据目录都是 ~/Zotero。
+	fallback := filepath.Join(home, "Zotero")
+	if fi, err := os.Stat(fallback); err == nil && fi.IsDir() {
+		return fallback
+	}
+	return ""
 }
 
 // ServerConfig 描述对外 HTTP 服务。
@@ -108,14 +189,16 @@ type LogConfig struct {
 
 // CitationStyle 是某个平台的引文显示配置。
 type CitationStyle struct {
-	Mode   string   `toml:"mode" json:"mode"`     // markdown / plain
-	Fields []string `toml:"fields" json:"fields"` // doc/file/heading/text，按顺序显示
+	Mode           string   `toml:"mode" json:"mode"`     // markdown / plain
+	Fields         []string `toml:"fields" json:"fields"` // 悬浮内容字段
+	ReferenceStyle string   `toml:"style" json:"style"`   // 当前客户端的参考文献格式
 }
 
 // CitationConfig 按客户端平台保存引文格式。
 type CitationConfig struct {
-	Version  int                      `toml:"version" json:"version"`
-	Profiles map[string]CitationStyle `toml:"profiles" json:"profiles"`
+	Version        int                      `toml:"version" json:"version"`
+	ReferenceStyle string                   `toml:"style" json:"style"` // 参考文献格式（全局）
+	Profiles       map[string]CitationStyle `toml:"profiles" json:"profiles"`
 }
 
 // CitationProfiles 是设置页展示的平台及名称。
@@ -132,7 +215,7 @@ var CitationProfiles = []struct {
 	{"dsh", "DSH"},
 }
 
-var defaultCitationFields = []string{"cite", "log", "doc", "file", "text"}
+var defaultCitationFields = []string{"link", "reference", "file", "text"}
 
 func defaultCitationProfiles() map[string]CitationStyle {
 	out := make(map[string]CitationStyle, len(CitationProfiles))
@@ -141,9 +224,48 @@ func defaultCitationProfiles() map[string]CitationStyle {
 		if p.ID == "zcode" {
 			mode = "plain"
 		}
-		out[p.ID] = CitationStyle{Mode: mode, Fields: append([]string(nil), defaultCitationFields...)}
+		var fields []string
+		if mode == "markdown" {
+			fields = defaultCitationFields
+		}
+		out[p.ID] = CitationStyle{Mode: mode, Fields: append([]string(nil), fields...)}
 	}
 	return out
+}
+
+// NormalizeZotero 补齐 Zotero 联动配置的默认值与合法取值。
+func NormalizeZotero(z *ZoteroConfig) {
+	if z == nil {
+		return
+	}
+	if strings.TrimSpace(z.DataDir) == "" {
+		z.DataDir = DefaultZoteroDataDir()
+	}
+	if strings.TrimSpace(z.APIBase) == "" {
+		z.APIBase = "http://127.0.0.1:23119/api"
+	}
+	z.APIBase = strings.TrimRight(strings.TrimSpace(z.APIBase), "/")
+	if strings.TrimSpace(z.LibraryID) == "" {
+		z.LibraryID = "0"
+	}
+	switch strings.ToLower(strings.TrimSpace(z.MDMode)) {
+	case "off", "larder", "storage":
+		z.MDMode = strings.ToLower(strings.TrimSpace(z.MDMode))
+	default:
+		z.MDMode = "storage"
+	}
+	if strings.TrimSpace(z.CiteStyle) == "" {
+		z.CiteStyle = "gb-t-7714-numeric"
+	}
+	switch strings.ToLower(strings.TrimSpace(z.ParseMode)) {
+	case "auto", "layout", "zotero":
+		z.ParseMode = strings.ToLower(strings.TrimSpace(z.ParseMode))
+	default:
+		z.ParseMode = "auto"
+	}
+	if z.WatchInterval.Std() <= 0 {
+		z.WatchInterval = Duration(5 * time.Second)
+	}
 }
 
 // NormalizeCitation 补齐平台、校验字段与显示模式。
@@ -151,9 +273,12 @@ func NormalizeCitation(c *CitationConfig) {
 	if c == nil {
 		return
 	}
+	if strings.TrimSpace(c.ReferenceStyle) == "" {
+		c.ReferenceStyle = "gb-t-7714-numeric"
+	}
 	if c.Profiles == nil {
 		c.Profiles = defaultCitationProfiles()
-		c.Version = 2
+		c.Version = 5
 		return
 	}
 	delete(c.Profiles, "generic")
@@ -164,22 +289,6 @@ func NormalizeCitation(c *CitationConfig) {
 		}
 	}
 	for key, st := range c.Profiles {
-		rawFields := st.Fields
-		if rawFields == nil {
-			rawFields = append([]string(nil), defaultCitationFields...)
-		}
-		if c.Version < 2 {
-			foundCite := false
-			for _, f := range rawFields {
-				if strings.EqualFold(strings.TrimSpace(f), "cite") {
-					foundCite = true
-					break
-				}
-			}
-			if !foundCite {
-				rawFields = append([]string{"cite"}, rawFields...)
-			}
-		}
 		mode := strings.ToLower(strings.TrimSpace(st.Mode))
 		if mode != "plain" {
 			mode = "markdown"
@@ -188,11 +297,20 @@ func NormalizeCitation(c *CitationConfig) {
 		if key == "zcode" {
 			mode = "plain"
 		}
-		fields := make([]string, 0, len(rawFields)+2)
+		rawFields := st.Fields
+		if rawFields == nil {
+			if mode == "markdown" {
+				rawFields = append([]string(nil), defaultCitationFields...)
+			} else {
+				rawFields = []string{}
+			}
+		}
+		// 可选字段：链接、文献词条、文献文件名、原文；其余旧字段丢弃。
+		fields := make([]string, 0, 4)
 		seen := map[string]bool{}
 		for _, f := range rawFields {
 			f = strings.ToLower(strings.TrimSpace(f))
-			if f != "cite" && f != "log" && f != "doc" && f != "file" && f != "heading" && f != "text" {
+			if f != "link" && f != "reference" && f != "file" && f != "text" {
 				continue
 			}
 			if seen[f] {
@@ -201,23 +319,38 @@ func NormalizeCitation(c *CitationConfig) {
 			seen[f] = true
 			fields = append(fields, f)
 		}
-		hasCite, hasLog := seen["cite"], seen["log"]
-		ordered := make([]string, 0, len(fields)+1)
-		if hasCite {
-			ordered = append(ordered, "cite")
+		styleID := strings.TrimSpace(st.ReferenceStyle)
+		if styleID == "" {
+			styleID = strings.TrimSpace(c.ReferenceStyle)
 		}
-		if hasLog {
-			ordered = append(ordered, "log")
+		if styleID == "" {
+			styleID = "gb-t-7714-numeric"
 		}
-		for _, f := range fields {
-			if f != "cite" && f != "log" {
-				ordered = append(ordered, f)
+		if mode == "markdown" {
+			// v5：旧配置补“链接”；悬浮模式下链接固定第一项。
+			if c.Version < 5 && !seen["link"] {
+				fields = append([]string{"link"}, fields...)
+				seen["link"] = true
+			}
+			ordered := make([]string, 0, len(fields))
+			if seen["link"] {
+				ordered = append(ordered, "link")
+			}
+			for _, f := range fields {
+				if f != "link" {
+					ordered = append(ordered, f)
+				}
+			}
+			fields = ordered
+			// v5 允许全部取消勾选：此时正文只显示 [1]，不再回填默认字段。
+			if len(fields) == 0 && c.Version < 5 {
+				fields = append(fields, defaultCitationFields...)
 			}
 		}
-		c.Profiles[key] = CitationStyle{Mode: mode, Fields: ordered}
+		c.Profiles[key] = CitationStyle{Mode: mode, Fields: fields, ReferenceStyle: styleID}
 	}
-	if c.Version < 2 {
-		c.Version = 2
+	if c.Version < 5 {
+		c.Version = 5
 	}
 }
 
@@ -229,10 +362,16 @@ func (c CitationConfig) Style(profile string) CitationStyle {
 		st, ok = c.Profiles["default"]
 	}
 	if !ok {
-		return CitationStyle{Mode: "markdown", Fields: append([]string(nil), defaultCitationFields...)}
+		st = CitationStyle{Mode: "markdown", Fields: append([]string(nil), defaultCitationFields...)}
 	}
 	if st.Mode == "" {
 		st.Mode = "markdown"
+	}
+	if strings.TrimSpace(st.ReferenceStyle) == "" {
+		st.ReferenceStyle = strings.TrimSpace(c.ReferenceStyle)
+	}
+	if st.ReferenceStyle == "" {
+		st.ReferenceStyle = "gb-t-7714-numeric"
 	}
 	return st
 }
@@ -277,7 +416,18 @@ func Default() Config {
 			},
 			Dim: 1536,
 		},
-		Citation: CitationConfig{Profiles: defaultCitationProfiles()},
+		Citation: CitationConfig{Version: 5, ReferenceStyle: "gb-t-7714-numeric", Profiles: defaultCitationProfiles()},
+		Zotero: ZoteroConfig{
+			Enabled:       false,
+			DataDir:       DefaultZoteroDataDir(),
+			APIBase:       "http://127.0.0.1:23119/api",
+			LibraryID:     "0",
+			MDMode:        "storage",
+			ParseMode:     "auto",
+			CiteStyle:     "gb-t-7714-numeric",
+			Watch:         true,
+			WatchInterval: Duration(5 * time.Second),
+		},
 		Rerank: Provider{
 			Enabled:  false,
 			Provider: "openai",
@@ -306,6 +456,18 @@ func Load(path string) (Config, string, error) {
 		b = []byte(os.ExpandEnv(string(b)))
 		if err := toml.Unmarshal(b, &cfg); err != nil {
 			return cfg, resolved, fmt.Errorf("解析配置 %s: %w", resolved, err)
+		}
+		// 旧配置没有 [citation].style 时，沿用 [zotero].cite_style。
+		var file struct {
+			Citation struct {
+				Style *string `toml:"style"`
+			} `toml:"citation"`
+		}
+		_ = toml.Unmarshal(b, &file)
+		if file.Citation.Style == nil || strings.TrimSpace(*file.Citation.Style) == "" {
+			if zs := strings.TrimSpace(cfg.Zotero.CiteStyle); zs != "" {
+				cfg.Citation.ReferenceStyle = zs
+			}
 		}
 	}
 
@@ -418,6 +580,23 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("LARDER_EMBED_DIM"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Embed.Dim = n
+		}
+	}
+	if v := os.Getenv("LARDER_ZOTERO_ENABLED"); v != "" {
+		c.Zotero.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	setStr(&c.Zotero.DataDir, "LARDER_ZOTERO_DATA_DIR")
+	setStr(&c.Zotero.APIBase, "LARDER_ZOTERO_API_BASE")
+	setStr(&c.Zotero.LibraryID, "LARDER_ZOTERO_LIBRARY_ID")
+	setStr(&c.Zotero.MDMode, "LARDER_ZOTERO_MD_MODE")
+	setStr(&c.Zotero.ParseMode, "LARDER_ZOTERO_PARSE_MODE")
+	setStr(&c.Zotero.CiteStyle, "LARDER_ZOTERO_CITE_STYLE")
+	if v := os.Getenv("LARDER_ZOTERO_WATCH"); v != "" {
+		c.Zotero.Watch = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("LARDER_ZOTERO_WATCH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Zotero.WatchInterval = Duration(d)
 		}
 	}
 }
@@ -537,6 +716,10 @@ func normalizeKeys(e *Endpoint) {
 
 // fill 兜底：确保关键字段非空且取值在合理范围。
 func fill(c *Config) {
+	// 旧配置把参考文献格式放在 [zotero].cite_style；迁移到 [citation].style。
+	if strings.TrimSpace(c.Citation.ReferenceStyle) == "" && strings.TrimSpace(c.Zotero.CiteStyle) != "" {
+		c.Citation.ReferenceStyle = c.Zotero.CiteStyle
+	}
 	NormalizeCitation(&c.Citation)
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8765"
@@ -588,6 +771,8 @@ func fill(c *Config) {
 	normalizeKeys(&c.Parse.Endpoint)
 	normalizeKeys(&c.Embed.Endpoint)
 	normalizeKeys(&c.Rerank.Endpoint)
+	// Zotero 联动默认值。
+	NormalizeZotero(&c.Zotero)
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}

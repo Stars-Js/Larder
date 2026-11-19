@@ -92,6 +92,42 @@
     window.addEventListener("resize", () => { if (window.innerWidth > 900) close(); });
   }
 
+  function initTheme() {
+    const btn = $("#themeToggle");
+    const root = document.documentElement;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    const apply = (theme, persist) => {
+      root.dataset.theme = theme;
+      if (persist) {
+        try { localStorage.setItem("larder.theme", theme); } catch {}
+      }
+      if (meta) meta.content = theme === "dark" ? "#17141f" : "#f8f5fc";
+      // 原生窗口标题栏跟随应用主题；普通浏览器里失败可忽略。
+      fetch("/api/system/window-theme", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ theme }),
+      }).catch(() => {});
+      if (btn) {
+        const dark = theme === "dark";
+        btn.title = dark ? "切换到亮色模式" : "切换到暗色模式";
+        btn.setAttribute("aria-label", btn.title);
+        btn.setAttribute("aria-pressed", dark ? "true" : "false");
+      }
+    };
+    apply(root.dataset.theme === "dark" ? "dark" : "light", false);
+    if (btn) {
+      btn.onclick = () => apply(root.dataset.theme === "dark" ? "light" : "dark", true);
+    }
+    const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+    if (media && media.addEventListener) {
+      media.addEventListener("change", (e) => {
+        let saved = null;
+        try { saved = localStorage.getItem("larder.theme"); } catch {}
+        if (!saved) apply(e.matches ? "dark" : "light", false);
+      });
+    }
+  }
+
   function fmtTime(s) {
     if (!s) return "";
     try {
@@ -338,7 +374,7 @@
           </span>
           <div style="min-width:0">
             <div class="kb-name" title="${esc(k.name)}">${esc(k.name)}</div>
-            <div class="kb-sub">${k.documents} 篇文档 · ${fmtTime(k.created_at)}</div>
+            <div class="kb-sub">${k.kind === "zotero" ? `Zotero · ${esc(k.zotero_collection || "文献库")} · ` : ""}${k.documents} 篇文档 · ${fmtTime(k.created_at)}</div>
           </div>
         </div>
         <div class="kb-meta">
@@ -356,7 +392,7 @@
           <h1 class="title">知识库</h1>
           <p class="desc">每个知识库拥有独立的文档与向量索引。进入后可拖入文件，流水线会依次完成解析、切块、向量化，检索时可再重排。</p>
         </div>
-        <div class="head-actions"><button class="btn primary" id="btnNewKb">＋ 新建知识库</button></div>
+        <div class="head-actions"><button class="btn" id="btnZoteroKb">从 Zotero 新建</button><button class="btn primary" id="btnNewKb">＋ 新建知识库</button></div>
       </div>
       <div class="kb-grid">
         ${cards}
@@ -369,6 +405,7 @@
     </div>`;
 
     $("#btnNewKb").onclick = promptNewKb;
+    $("#btnZoteroKb").onclick = () => { location.hash = "#/zotero"; };
     $("#cardNew").onclick = promptNewKb;
     $$(".kb-card[data-id]").forEach((card) => {
       const id = card.dataset.id;
@@ -442,6 +479,277 @@
       } catch (err) { toast(err.message, "err"); }
     };
   }
+
+  // ================= Zotero 文献库 =================
+  const ZOTERO_STYLES = [
+    ["gb-t-7714-numeric", "GB/T 7714 数字"],
+    ["gb-t-7714-author-date", "GB/T 7714 著者-年份"],
+    ["apa", "APA 7"],
+    ["ieee", "IEEE"],
+    ["vancouver", "Vancouver"],
+    ["mla", "MLA"],
+  ];
+
+  function zStyleOptions(selected) {
+    return ZOTERO_STYLES.map(([v, label]) =>
+      `<option value="${v}" ${v === selected ? "selected" : ""}>${label}</option>`).join("");
+  }
+
+  function zFlattenCollections(tree, depth = 0, out = []) {
+    (tree || []).forEach((c) => {
+      out.push({ key: c.key, name: c.name, depth, count: c.item_count || 0 });
+      zFlattenCollections(c.children || [], depth + 1, out);
+    });
+    return out;
+  }
+
+  async function saveZoteroSettings(patch) {
+    const cur = await api("/api/zotero/settings");
+    return api("/api/zotero/settings", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...cur, ...patch }),
+    });
+  }
+
+  async function pollZoteroJob(kbId, el) {
+    if (!el) return;
+    const tick = async () => {
+      try {
+        const s = await api("/api/kbs/" + encodeURIComponent(kbId) + "/zotero/status");
+        const job = s.job || {};
+        const parts = [`共 ${s.total || 0} 条`, `成功 ${s.synced || 0}`, `失败 ${s.failed || 0}`];
+        if (job.state === "running") {
+          parts.push(`同步中 ${job.done || 0}/${job.total || 0}`);
+          if (job.current) parts.push(job.current);
+        } else if (job.state) {
+          parts.push(`任务 ${job.state}`);
+        }
+        if (s.last_sync) parts.push(`上次同步 ${fmtTime(s.last_sync)}`);
+        el.textContent = parts.join(" · ");
+        if (job.state === "running") setTimeout(tick, 1500);
+      } catch (err) {
+        el.textContent = err.message;
+      }
+    };
+    tick();
+  }
+
+  async function openZoteroSettings(kbId) {
+    let s;
+    try { s = await api("/api/kbs/" + encodeURIComponent(kbId) + "/zotero/status"); }
+    catch (err) { toast(err.message, "err"); return; }
+    const m = modal({
+      title: "文献库设置",
+      sub: "解析来源与 Markdown 落盘位置；修改后对新检索立即生效。参考文献格式与引用显示方式请在「设置 → 引用格式」里调整。",
+      body: `<div style="display:grid;gap:14px">
+        <div class="field"><label>解析来源</label><select class="input" id="zsParse">
+          <option value="auto" ${s.parse_mode === "auto" ? "selected" : ""}>优先 PDF 版面解析（含图片）</option>
+          <option value="layout" ${s.parse_mode === "layout" ? "selected" : ""}>只用 PDF 版面解析</option>
+          <option value="zotero" ${s.parse_mode === "zotero" ? "selected" : ""}>只用 Zotero 全文缓存（快，无图片）</option>
+        </select></div>
+        <div class="field"><label>解析后 MD</label><select class="input" id="zsMd">
+          <option value="storage" ${s.md_mode === "storage" ? "selected" : ""}>PDF 同目录（storage）</option>
+          <option value="larder" ${s.md_mode === "larder" ? "selected" : ""}>Zotero/larder-md</option>
+          <option value="off" ${s.md_mode === "off" ? "selected" : ""}>不写文件</option>
+        </select></div>
+      </div>`,
+      actions: `<button class="btn" data-act="cancel">取消</button><button class="btn primary" data-act="ok">保存</button>`,
+    });
+    m.el.querySelector("[data-act=cancel]").onclick = m.close;
+    m.el.querySelector("[data-act=ok]").onclick = async () => {
+      try {
+        await api("/api/kbs/" + encodeURIComponent(kbId) + "/zotero/settings", {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            parse_mode: m.el.querySelector("#zsParse").value,
+            md_mode: m.el.querySelector("#zsMd").value,
+          }),
+        });
+        m.close();
+        toast("已保存文献库设置", "ok");
+        refreshLibrary(kbId);
+      } catch (err) { toast(err.message, "err"); }
+    };
+  }
+
+  async function syncZoteroKb(kbId, el, force = false) {
+    try {
+      await api("/api/kbs/" + encodeURIComponent(kbId) + "/zotero/sync", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(force ? { force: true } : {}),
+      });
+      toast(force ? "已开始强制重新解析" : "Zotero 同步已启动", "ok");
+      pollZoteroJob(kbId, el);
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  route("/zotero", async () => {
+    markNav("zotero");
+    const [status, zcfg, kbsData] = await Promise.all([
+      api("/api/zotero/status"), api("/api/zotero/settings"), api("/api/kbs"),
+    ]);
+    const kbs = (kbsData.kbs || []).filter((k) => k.kind === "zotero");
+    const libCards = kbs.map((k) => `
+      <div class="card card-pad" style="margin-bottom:12px">
+        <div style="display:flex;gap:12px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap">
+          <div style="min-width:0">
+            <div style="font-weight:600;font-size:15px">${esc(k.name)}</div>
+            <div class="hint" style="margin-top:3px">Zotero 集合：${esc(k.zotero_collection || "—")} · ${k.documents || 0} 篇文档</div>
+            <div class="hint" id="zj-${esc(k.id)}" style="margin-top:4px">正在读取同步状态…</div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn sm" data-open="${esc(k.id)}">打开</button>
+            <button class="btn primary sm" data-sync="${esc(k.id)}">同步</button>
+          </div>
+        </div>
+      </div>`).join("");
+
+    view.innerHTML = `<div class="wrap">
+      <div class="page-head">
+        <div>
+          <div class="eyebrow">Zotero</div>
+          <h1 class="title">文献库</h1>
+          <p class="desc">把 Zotero 中的一个集合同步成 Larder 文献库：解析全文、切块、嵌入，并保留作者、年份、DOI 与引用信息。PDF 不复制，只保存派生索引。</p>
+        </div>
+        <div class="head-actions"><button class="btn" id="btnZRefresh">刷新</button></div>
+      </div>
+
+      <section class="settings-section">
+        <div class="card group">
+          <div class="list-head"><h2>Zotero 联动</h2><span class="hint">${status.api_available ? "本地 API 可用" : "本地 API 不可用，将回退 SQLite 快照"}</span></div>
+          <div class="card-pad" style="display:grid;gap:14px">
+            <label style="display:flex;align-items:center;gap:10px;font-size:13.5px">
+              <input type="checkbox" id="zEnabled" ${zcfg.enabled ? "checked" : ""}>
+              开启 Zotero 联动
+            </label>
+            <div class="field"><label>Zotero 数据目录</label>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <input class="input" id="zDataDir" style="flex:1;min-width:240px" value="${esc(zcfg.data_dir || status.detected_data_dir || status.data_dir || "")}" placeholder="自动读取 Zotero 设置；读取不到再选择文件夹">
+                <button class="btn" id="btnZBrowse">选择…</button>
+                <button class="btn" id="btnZDetect">检测集合</button>
+              </div>
+              <div class="hint" style="margin-top:6px">
+                自动读取：${esc(status.detected_data_dir || "未检测到，请手动填写")} · 本地 API：${esc(zcfg.api_base || "")}${status.api_error ? "（" + esc(status.api_error) + "）" : ""}
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
+              <div class="field"><label>新文献库名称</label><input class="input" id="zName" placeholder="留空则使用集合名"></div>
+              <div class="field"><label>解析后 MD</label>
+                <select class="input" id="zMdMode">
+                  <option value="storage" ${zcfg.md_mode === "storage" ? "selected" : ""}>PDF 同目录（storage）</option>
+                  <option value="larder" ${zcfg.md_mode === "larder" ? "selected" : ""}>Zotero/larder-md</option>
+                  <option value="off" ${zcfg.md_mode === "off" ? "selected" : ""}>不写文件</option>
+                </select>
+              </div>
+              <div class="field"><label>解析来源</label>
+                <select class="input" id="zParseMode">
+                  <option value="auto" ${zcfg.parse_mode === "auto" ? "selected" : ""}>优先 PDF 版面解析（含图片）</option>
+                  <option value="layout" ${zcfg.parse_mode === "layout" ? "selected" : ""}>只用 PDF 版面解析</option>
+                  <option value="zotero" ${zcfg.parse_mode === "zotero" ? "selected" : ""}>只用 Zotero 全文缓存（快，无图片）</option>
+                </select>
+              </div>
+            </div>
+            <div class="hint">参考文献格式、正文引用标记和文末参考文献请在「设置 → 引用格式」里统一配置；这里只管理解析与同步。</div>
+            <div style="display:flex;gap:18px;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:10px;font-size:13.5px">
+                <input type="checkbox" id="zSub" checked> 包含子集合
+              </label>
+              <label style="display:flex;align-items:center;gap:10px;font-size:13.5px">
+                <input type="checkbox" id="zWatch" ${zcfg.watch ? "checked" : ""}> 监听 Zotero 变更并自动同步
+              </label>
+            </div>
+            <div id="zCollections" class="hint">点击「检测集合」读取 Zotero 文件夹。</div>
+            <div><button class="btn primary" id="btnZCreate" disabled>创建文献库并开始同步</button></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <div class="list-head"><h2>已有文献库</h2><span class="hint">${kbs.length} 个</span></div>
+        ${libCards || `<div class="empty"><h3>还没有 Zotero 文献库</h3><p>选择 Zotero 集合后创建，Larder 会在后台逐篇解析并嵌入。</p></div>`}
+      </section>
+    </div>`;
+
+    $("#btnZRefresh").onclick = () => dispatch();
+    $("#zEnabled").onchange = async (e) => {
+      try { await saveZoteroSettings({ enabled: e.target.checked }); toast(e.target.checked ? "已开启 Zotero 联动" : "已关闭 Zotero 联动", "ok"); }
+      catch (err) { toast(err.message, "err"); e.target.checked = !e.target.checked; }
+    };
+    $("#zWatch").onchange = async (e) => {
+      try { await saveZoteroSettings({ watch: e.target.checked }); toast(e.target.checked ? "已开启 Zotero 变更监听" : "已关闭自动同步", "ok"); }
+      catch (err) { toast(err.message, "err"); e.target.checked = !e.target.checked; }
+    };
+
+    let collections = [];
+    const renderCollections = () => {
+      const box = $("#zCollections");
+      if (!collections.length) { box.textContent = "没有读到集合。请确认数据目录正确，且 Zotero 本地 API 已开启或 zotero.sqlite 存在。"; return; }
+      box.innerHTML = `<div style="max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:8px">
+        ${collections.map((c, i) => `<label style="display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:8px;cursor:pointer">
+          <input type="radio" name="zCollection" value="${esc(c.key)}" data-name="${esc(c.name)}" ${i === 0 ? "checked" : ""}>
+          <span style="padding-left:${c.depth * 16}px">${esc(c.name)}</span>
+          <span class="hint" style="margin-left:auto">${c.count || 0} 篇</span>
+        </label>`).join("")}
+      </div>`;
+    };
+    $("#btnZBrowse").onclick = async () => {
+      const btn = $("#btnZBrowse");
+      btn.disabled = true;
+      try {
+        const data = await api("/api/system/pick-folder", { method: "POST" });
+        if (data.path) {
+          $("#zDataDir").value = data.path;
+          toast("已选择 Zotero 数据目录", "ok");
+        }
+      } catch (err) { toast(err.message, "err"); }
+      finally { btn.disabled = false; }
+    };
+    $("#btnZDetect").onclick = async () => {
+      const btn = $("#btnZDetect");
+      btn.disabled = true;
+      try {
+        const dir = $("#zDataDir").value.trim();
+        await saveZoteroSettings({ data_dir: dir });
+        const data = await api("/api/zotero/collections?data_dir=" + encodeURIComponent(dir));
+        collections = zFlattenCollections(data.collections || []);
+        renderCollections();
+        $("#btnZCreate").disabled = collections.length === 0;
+        toast(`读取到 ${collections.length} 个集合`, "ok");
+      } catch (err) { toast(err.message, "err"); }
+      finally { btn.disabled = false; }
+    };
+
+    $("#btnZCreate").onclick = async () => {
+      const picked = $("input[name=zCollection]:checked");
+      if (!picked) { toast("请先选择一个 Zotero 集合", "err"); return; }
+      const btn = $("#btnZCreate");
+      btn.disabled = true;
+      try {
+        const dir = $("#zDataDir").value.trim();
+        await saveZoteroSettings({
+          data_dir: dir, md_mode: $("#zMdMode").value,
+          parse_mode: $("#zParseMode").value,
+          watch: $("#zWatch").checked,
+        });
+        const info = await api("/api/zotero/libraries", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: $("#zName").value.trim(), data_dir: dir,
+            collection_key: picked.value, collection_name: picked.dataset.name,
+            include_subcollections: $("#zSub").checked,
+            md_mode: $("#zMdMode").value, parse_mode: $("#zParseMode").value,
+            sync_now: true,
+          }),
+        });
+        toast("已创建文献库「" + info.name + "」，同步已在后台开始", "ok");
+        location.hash = "#/library/" + encodeURIComponent(info.id);
+      } catch (err) { toast(err.message, "err"); btn.disabled = false; }
+    };
+
+    $$("[data-open]").forEach((b) => b.onclick = () => { location.hash = "#/library/" + encodeURIComponent(b.dataset.open); });
+    $$("[data-sync]").forEach((b) => b.onclick = () => syncZoteroKb(b.dataset.sync, $("#zj-" + CSS.escape(b.dataset.sync))));
+    kbs.forEach((k) => pollZoteroJob(k.id, $("#zj-" + CSS.escape(k.id))));
+  });
 
   // ================= 知识库详情 =================
   function stageChip(label, stage, status) {
@@ -721,6 +1029,17 @@
         out.push(`<blockquote>${buf.map(inline).join("<br>")}</blockquote>`);
         continue;
       }
+      m = line.match(/^\s*!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
+      if (m) {
+        const url = m[2];
+        if (/^(https?:|\/api\/)/i.test(url)) {
+          out.push(`<img class="md-img" src="${esc(url)}" alt="${esc(m[1])}" loading="lazy">`);
+        } else {
+          out.push(`<p>${inline(line)}</p>`);
+        }
+        i++;
+        continue;
+      }
       m = line.match(/^\s*([-*+]|\d+\.)\s+(.*)$/);
       if (m) {
         const ordered = /^\d+\./.test(m[1]);
@@ -945,6 +1264,19 @@
         </div>
       </div>
 
+      ${info.kind === "zotero" ? `<div class="card card-pad" style="margin-bottom:12px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+        <div style="min-width:0">
+          <div style="font-weight:600">Zotero 文献库 · ${esc(info.zotero_collection || "未命名集合")}</div>
+          <div class="hint" id="zoteroJob" style="margin-top:4px">正在读取同步状态…</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <a class="btn sm" href="/api/kbs/${encodeURIComponent(info.id)}/bibliography.bib" target="_blank" rel="noreferrer">导出 .bib</a>
+          <button class="btn sm" id="btnZoteroSettings">引用设置</button>
+          <button class="btn sm" id="btnZoteroForce" title="忽略 dateModified，重新解析全部条目（用于切换版面解析后刷新）">强制重解析</button>
+          <button class="btn primary sm" id="btnZoteroSync">同步 Zotero</button>
+        </div>
+      </div>` : ""}
+
       <div id="libPipe">${pipelineHTML(info)}</div>
 
       <div style="height:16px"></div>
@@ -982,6 +1314,12 @@
     $("#btnRename").onclick = () => renameKb(id, info.name);
     setupDropzone(id);
     paintLibrary(info, docs);
+    if (info.kind === "zotero") {
+      $("#btnZoteroSync").onclick = () => syncZoteroKb(id, $("#zoteroJob"));
+      $("#btnZoteroForce").onclick = () => syncZoteroKb(id, $("#zoteroJob"), true);
+      $("#btnZoteroSettings").onclick = () => openZoteroSettings(id);
+      pollZoteroJob(id, $("#zoteroJob"));
+    }
   });
 
   function renameKb(id, cur) {
@@ -1459,35 +1797,46 @@
   let citationProfiles = {};
   let citationPlatforms = [];
   let citationProfile = localStorage.getItem("larder.citationProfile") || "default";
+  const CITE_PREVIEW_FALLBACK = {
+    mark: "[1]",
+    reference: "张三, 李四, 王五. 组内研究进展[J]. 计算机学报, 2026, 49(3): 1-12.",
+    reference_line: "[1] 张三, 李四, 王五. 组内研究进展[J]. 计算机学报, 2026, 49(3): 1-12.",
+  };
+  const citationPreviewCache = new Map();
+  let citationPreviewSeq = 0;
   const CITE_FIELDS = [
-    { id: "cite", label: "引用标记", sample: "[cite:id]" },
-    { id: "log", label: "日志", sample: "http://127.0.0.1:8765/c/事件id" },
-    { id: "doc", label: "文档", sample: "组内研究进展" },
-    { id: "file", label: "文件", sample: "组内研究进展.pdf" },
-    { id: "heading", label: "章节", sample: "技术路径" },
+    { id: "link", label: "链接", sample: "http://127.0.0.1:8765/r/知识库/文档" },
+    { id: "reference", label: "文献词条", sample: "张三等. 论文标题[J]. 期刊, 2026." },
+    { id: "file", label: "文献文件名", sample: "论文标题.pdf" },
     { id: "text", label: "原文", sample: "ATE 0.203 m，等价性检验 p = 0.35…" },
   ];
-  const CITE_DEFAULT_FIELDS = ["cite", "log", "doc", "file", "text"];
+  const CITE_DEFAULT_FIELDS = ["link", "reference", "file", "text"];
 
   function defaultCiteStyle() {
-    return { mode: "markdown", fields: CITE_DEFAULT_FIELDS.slice() };
+    return { mode: "markdown", fields: CITE_DEFAULT_FIELDS.slice(), style: "gb-t-7714-numeric" };
   }
 
-  function normalizeCitationProfiles(raw) {
+  function normalizeCiteStyle(value, fallback) {
+    const v = String(value || "").trim();
+    if (ZOTERO_STYLES.some(([id]) => id === v)) return v;
+    const f = String(fallback || "").trim();
+    return ZOTERO_STYLES.some(([id]) => id === f) ? f : "gb-t-7714-numeric";
+  }
+
+  function normalizeCitationProfiles(raw, fallbackStyle) {
     const list = citationPlatforms.length ? citationPlatforms : [{ id: "default", name: "默认" }];
     const out = {};
+    const fallback = normalizeCiteStyle(fallbackStyle, "gb-t-7714-numeric");
     for (const p of list) {
       const src = raw && raw[p.id] ? raw[p.id] : {};
       const mode = p.id === "zcode" ? "plain" : (src.mode === "plain" ? "plain" : "markdown");
-      const fields = Array.isArray(src.fields) ? src.fields.filter((f) => CITE_FIELDS.some((x) => x.id === f)) : CITE_DEFAULT_FIELDS.slice();
-      const set = new Set(fields);
-      const hasCite = set.has("cite");
-      const hasLog = set.has("log");
-      const ordered = [];
-      if (hasCite) ordered.push("cite");
-      if (hasLog) ordered.push("log");
-      for (const id of ["doc", "file", "heading", "text"]) if (set.has(id)) ordered.push(id);
-      out[p.id] = { mode, fields: ordered };
+      // fields 只描述悬浮内容：纯文本模式不使用，但切换回悬浮时应保留。
+      const srcFields = Array.isArray(src.fields) ? src.fields : CITE_DEFAULT_FIELDS.slice();
+      let fields = srcFields.filter((f) => CITE_FIELDS.some((x) => x.id === f));
+      if (fields.includes("link")) {
+        fields = ["link", ...fields.filter((f) => f !== "link")];
+      }
+      out[p.id] = { mode, fields, style: normalizeCiteStyle(src.style, fallback) };
     }
     return out;
   }
@@ -1496,59 +1845,117 @@
     return citationProfiles[citationProfile] || defaultCiteStyle();
   }
 
-  function citationPreview() {
-    const st = citationStyle();
-    const link = "http://127.0.0.1:端口/c/事件id";
-    const showCite = st.fields.includes("cite");
-    const showLog = st.fields.includes("log");
-    const source = st.fields
-      .filter((id) => id !== "cite" && id !== "log")
-      .map((id) => {
-        const f = CITE_FIELDS.find((x) => x.id === id);
-        return f ? `【${f.label}】…` : "";
-      }).join("");
-    if (st.mode === "markdown" && showCite && showLog) {
-      return source ? `[[cite:id]](${link} "${source}")` : `[[cite:id]](${link})`;
+  async function loadCitationPreview() {
+    const style = normalizeCiteStyle(citationStyle().style, "gb-t-7714-numeric");
+    if (citationPreviewCache.has(style)) {
+      renderCitationEditor();
+      return;
     }
-    const body = [];
-    if (showLog) body.push(`【日志】${link}`);
-    if (source) body.push(source);
-    const prefix = showCite ? "[cite:id]" : "";
-    return body.length ? `${prefix}（${body.join("；")}）` : prefix;
+    const seq = ++citationPreviewSeq;
+    try {
+      const data = await api("/api/citation/preview?style=" + encodeURIComponent(style));
+      if (seq !== citationPreviewSeq) return;
+      citationPreviewCache.set(style, data || CITE_PREVIEW_FALLBACK);
+    } catch (err) {
+      if (seq !== citationPreviewSeq) return;
+      // 接口失败时使用内置样例，避免设置页不可用。
+      citationPreviewCache.set(style, CITE_PREVIEW_FALLBACK);
+    }
+    renderCitationEditor();
+  }
+
+  function citationPreviewData() {
+    const st = citationStyle();
+    const style = normalizeCiteStyle(st.style, "gb-t-7714-numeric");
+    const preview = citationPreviewCache.get(style) || CITE_PREVIEW_FALLBACK;
+    const mark = preview.mark || "[1]";
+    const reference = preview.reference_line || preview.reference || "";
+    if (st.mode === "markdown") {
+      const title = st.fields
+        .filter((id) => id !== "link")
+        .map((id) => {
+          const f = CITE_FIELDS.find((x) => x.id === id);
+          return f ? `【${f.label}】…` : "";
+        }).join("");
+      let hover = title;
+      if (!st.fields.includes("link")) {
+        hover = "（未勾选“链接”，正文只显示 [1]，没有悬浮内容）";
+      } else if (!title) {
+        hover = "（未勾选显示内容，悬停没有内容）";
+      }
+      return { mode: "markdown", body: mark, hover, reference, style };
+    }
+    // 纯文本只输出参考文献标准规定的文内标记，不附加任何自定义字段。
+    return { mode: "plain", body: mark, hover: "", reference, style };
   }
 
   function renderCitationEditor() {
     const el = $("#citationEditor");
     if (!el) return;
     const st = citationStyle();
-    const checks = CITE_FIELDS.map((f) => `<label class="cite-check"><input type="checkbox" data-cite-field="${f.id}" ${st.fields.includes(f.id) ? "checked" : ""}><span>${f.label}</span></label>`).join("");
-    const sourceFields = st.fields.filter((id) => id !== "cite" && id !== "log");
-    const order = sourceFields.map((id, i) => {
-      const f = CITE_FIELDS.find((x) => x.id === id);
-      if (!f) return "";
-      return `<div class="cite-order-item"><span>${f.label}</span><span class="cite-order-btns">
-        <button class="btn ghost icon sm" data-cite-up="${id}" ${i === 0 ? "disabled" : ""} aria-label="上移">↑</button>
-        <button class="btn ghost icon sm" data-cite-down="${id}" ${i === sourceFields.length - 1 ? "disabled" : ""} aria-label="下移">↓</button>
-      </span></div>`;
-    }).join("");
+    const isHover = st.mode === "markdown";
+    if (st.fields.includes("link")) {
+      st.fields = ["link", ...st.fields.filter((f) => f !== "link")];
+    }
+    const previews = citationPreviewData();
+    const plainMark = previews.body || "[1]";
+    let fieldsHTML = "";
+    if (isHover) {
+      const checks = CITE_FIELDS.map((f) => `<label class="cite-check"><input type="checkbox" data-cite-field="${f.id}" ${st.fields.includes(f.id) ? "checked" : ""}><span>${f.label}</span></label>`).join("");
+      const sourceFields = st.fields.slice();
+      const linkFixed = sourceFields[0] === "link";
+      const order = sourceFields.map((id, i) => {
+        const f = CITE_FIELDS.find((x) => x.id === id);
+        if (!f) return "";
+        const upDisabled = i === 0 || (linkFixed && i === 1);
+        const downDisabled = i === sourceFields.length - 1 || (id === "link" && linkFixed);
+        return `<div class="cite-order-item"><span>${f.label}${id === "link" && linkFixed ? "（固定第一项）" : ""}</span><span class="cite-order-btns">
+          <button class="btn ghost icon sm" data-cite-up="${id}" ${upDisabled ? "disabled" : ""} aria-label="上移">↑</button>
+          <button class="btn ghost icon sm" data-cite-down="${id}" ${downDisabled ? "disabled" : ""} aria-label="下移">↓</button>
+        </span></div>`;
+      }).join("");
+      fieldsHTML = `<div class="field" style="margin-top:12px">
+          <label>悬浮内容（链接、文献词条、文献文件名、原文；勾选并上下排序；链接固定第一项）</label>
+          <div class="cite-checks">${checks}</div>
+          <div class="cite-order">${order || `<span class="hint">没有悬浮字段，悬停时不显示内容。</span>`}</div>
+        </div>`;
+    }
+    const refPreview = previews.reference || "（暂无参考文献预览）";
     el.innerHTML = `<div class="field">
+        <label>参考文献格式（当前客户端）</label>
+        <select class="input" id="citeReferenceStyle">${zStyleOptions(previews.style)}</select>
+        <span class="hint">只影响当前客户端 / agent 的正文标记和文末参考文献；切换平台可分别设置。</span>
+      </div>
+      <div class="field" style="margin-top:12px">
         <label>显示方式</label>
         <div class="cite-modes">
-          <button class="btn sm ${st.mode === "markdown" ? "primary" : ""}" data-cite-mode="markdown" ${citationProfile === "zcode" ? "disabled" : ""}>悬浮链接</button>
-          <button class="btn sm ${st.mode === "plain" ? "primary" : ""}" data-cite-mode="plain">纯文本</button>
+          <button class="btn sm ${isHover ? "primary" : ""}" data-cite-mode="markdown" ${citationProfile === "zcode" ? "disabled" : ""}>悬浮链接</button>
+          <button class="btn sm ${!isHover ? "primary" : ""}" data-cite-mode="plain">纯文本</button>
         </div>
-        <span class="hint">${citationProfile === "zcode" ? "ZCode 会移除 Markdown 链接，因此固定使用纯文本引用。" : "悬浮链接：正文显示 [cite:id]，悬停看来源，点击进日志；纯文本：直接显示来源与日志短链，适合会移除链接的客户端。"}</span>
+        <span class="hint">${citationProfile === "zcode" ? "ZCode 会移除 Markdown 链接，因此固定使用纯文本引用。" : `悬浮链接：正文显示文内引用标记；勾选「链接」后，悬停按下面顺序显示悬浮内容。纯文本：按参考文献格式只输出文内标记和文末参考文献，页面下方不提供悬浮内容设置。`}</span>
       </div>
-      <div class="field" style="margin-top:12px">
-        <label>引文字段（引用标记固定第一位；日志可选，勾选后固定第二位）</label>
-        <div class="cite-checks">${checks}</div>
-        <div class="cite-order">${order || `<span class="hint">没有其他来源字段。</span>`}</div>
-      </div>
+      ${fieldsHTML}
       <div class="field" style="margin-top:12px">
         <label>预览</label>
-        <pre class="cite-preview">${esc(citationPreview())}</pre>
-        <span class="hint">悬浮链接模式：引用标记 + 日志链接组合成 [[cite:id]](日志链接 "字段…")；纯文本模式为 [cite:id]（【日志】链接；字段…）。引用标记固定第一位；日志可选，勾选后固定紧随引用标记；其余字段可勾选排序。调整后自动保存。</span>
+        <div class="cite-preview-label">正文预览</div>
+        <pre class="cite-preview">${esc(previews.body)}</pre>
+        ${isHover ? `
+        <div class="cite-preview-label" style="margin-top:10px">悬浮预览</div>
+        <pre class="cite-preview">${esc(previews.hover)}</pre>` : ""}
+        <div class="cite-preview-label" style="margin-top:10px">文末参考文献预览</div>
+        <pre class="cite-preview">${esc("## 参考文献\n\n" + refPreview)}</pre>
+        <span class="hint">${isHover
+          ? "正文预览只显示文内引用标记；悬浮预览显示勾选字段；文末参考文献严格按所选格式输出。"
+          : `纯文本严格按照参考文献格式输出：正文只有 ${plainMark}，文末输出完整参考文献；不再附加链接、文献词条、文件名或原文。`}</span>
       </div>`;
+    const styleSel = $("#citeReferenceStyle");
+    if (styleSel) {
+      styleSel.onchange = () => {
+        st.style = styleSel.value;
+        markCitationDirty();
+        loadCitationPreview();
+      };
+    }
     $$("[data-cite-mode]", el).forEach((btn) => {
       btn.onclick = () => {
         st.mode = btn.dataset.citeMode;
@@ -1560,10 +1967,8 @@
         const id = cb.dataset.citeField;
         if (cb.checked) {
           if (!st.fields.includes(id)) {
-            if (id === "cite") {
-              st.fields.unshift("cite");
-            } else if (id === "log") {
-              st.fields.splice(st.fields.includes("cite") ? 1 : 0, 0, "log");
+            if (id === "link") {
+              st.fields.unshift("link");
             } else {
               st.fields.push(id);
             }
@@ -1603,6 +2008,7 @@
         localStorage.setItem("larder.citationProfile", citationProfile);
         renderCitationPlatforms();
         renderCitationEditor();
+        loadCitationPreview();
       };
     });
   }
@@ -1613,10 +2019,12 @@
       { id: "claude-desktop", name: "Claude Desktop" }, { id: "claude-code", name: "Claude Code" },
       { id: "cursor", name: "Cursor" }, { id: "dsh", name: "DSH" },
     ];
-    citationProfiles = normalizeCitationProfiles(s.citation && s.citation.profiles);
+    const fallbackStyle = (s.citation && s.citation.style) || (s.zotero && s.zotero.cite_style) || "gb-t-7714-numeric";
+    citationProfiles = normalizeCitationProfiles(s.citation && s.citation.profiles, fallbackStyle);
     if (!citationProfiles[citationProfile]) citationProfile = "default";
     renderCitationPlatforms();
     renderCitationEditor();
+    loadCitationPreview();
   }
 
   const settingsKeys = { parse: [], embed: [], rerank: [] };
@@ -1930,15 +2338,15 @@
               </div>
             </div>
             <p class="hint">Claude Code 示例：<code style="font-family:var(--code);font-size:11.5px">claude mcp add --transport http larder http://${esc(mcpEndpoint.replace(/^https?:\/\//, ""))}</code></p>
-            <p class="hint">连接后默认检索全部知识库；只有用户明确指定时才调用 <code>larder_use_kb</code> 选定单个库。回答右上角会带 📚 Larder · 知识库 小标，引用片段含文档名、文件与章节。</p>
+            <p class="hint">首次检索如果存在多个文献库，ZCode 等支持 MCP elicitation 的客户端会弹出可点击选项；不支持的客户端回退为库列表，也可调用 <code>larder_select_library</code> 选择。回答右上角会带 📚 Larder · 知识库 小标，引用片段含文档名、文件与章节。</p>
             <p class="hint">MCP 会返回 Markdown 右对齐小标（表格形式），Cherry 会把它显示在回答右上角；更新 MCP 后请在 Cherry 中重连或重启，并新建会话。</p>
-            <p class="hint">ZCode 会移除 Markdown 链接，因此 ZCode 使用独立的纯文本引用格式：[cite:片段id]（【日志】短链；【文档】/【文件】/【章节】/【原文】），点击日志短链可到本次检索详情；请重新注入 ZCode 以更新地址。</p>
+            <p class="hint">ZCode 会移除 Markdown 链接，因此 ZCode 固定使用纯文本引用；正文只保留文内标记，文末按所选参考文献格式输出。修改后请重新注入 ZCode 以更新地址。</p>
           </div>
         </div>
       </section>
 
       <section class="settings-section">
-        <div class="sec-head"><h2>引用格式</h2><p>按客户端平台配置正文引文；默认显示文档、文件与原文，可勾选字段并调整顺序。保存后请在该平台重新执行一次一键注入，使 MCP 地址带上对应的平台标识。</p></div>
+        <div class="sec-head"><h2>引用格式</h2><p>按客户端 / agent 分别设置参考文献格式与显示方式，各平台的格式互不影响。纯文本严格按该平台的参考文献格式输出：正文只有文内引用标记，文末输出完整参考文献；悬浮链接额外支持自定义悬浮内容，并显示正文、悬浮和文末参考文献三个预览。保存后请在该平台重新执行一次一键注入，使 MCP 地址带上对应的平台标识。</p></div>
         <div class="card card-pad">
           <div class="citation-platforms" id="citationPlatforms"></div>
           <div id="citationEditor"></div>
@@ -2381,6 +2789,7 @@
   // ---------------- 启动 ----------------
   window.addEventListener("hashchange", dispatch);
   window.addEventListener("DOMContentLoaded", () => {
+    initTheme();
     initSidebar();
     checkHealth();
     dispatch();

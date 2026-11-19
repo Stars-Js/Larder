@@ -40,10 +40,48 @@ type Result struct {
 	RerankError string
 }
 
+// Dim 返回当前知识库的向量维度；未初始化时为 0。
+func (s *Service) Dim() int { return s.store.Dim() }
+
+// EmbedQuery 只做查询向量化并记录一次用量。
+// 多知识库检索可以复用返回值，避免每个库重复调用 embedding 服务。
+func (s *Service) EmbedQuery(ctx context.Context, query string) ([]float32, error) {
+	if query == "" {
+		return nil, fmt.Errorf("查询内容不能为空")
+	}
+	vecs, err := s.embedder.Embed(ctx, []string{query})
+	if err != nil {
+		s.recordUsage(ctx, store.UsageEvent{Kind: "embed", Model: s.embedModel, Status: "error"})
+		return nil, fmt.Errorf("查询向量化失败: %w", err)
+	}
+	if len(vecs) != 1 || len(vecs[0]) == 0 {
+		s.recordUsage(ctx, store.UsageEvent{Kind: "embed", Model: s.embedModel, Status: "error"})
+		return nil, fmt.Errorf("查询向量为空")
+	}
+	s.recordUsage(ctx, store.UsageEvent{
+		Kind: "embed", Model: s.embedModel, Chars: int64(len([]rune(query))),
+		Tokens: embedTokens(s.embedder, []string{query}), Status: "ok",
+	})
+	return vecs[0], nil
+}
+
 // Search 执行检索。返回的命中带文档标题、来源、标题路径与得分。
 func (s *Service) Search(ctx context.Context, query string, opt Options) (Result, error) {
+	vec, err := s.EmbedQuery(ctx, query)
+	if err != nil {
+		return Result{}, err
+	}
+	return s.SearchVector(ctx, query, vec, opt)
+}
+
+// SearchVector 使用已算好的查询向量执行召回与重排。
+// 多库检索时先 EmbedQuery 一次，再对每个库调用本方法。
+func (s *Service) SearchVector(ctx context.Context, query string, vector []float32, opt Options) (Result, error) {
 	if query == "" {
 		return Result{}, fmt.Errorf("查询内容不能为空")
+	}
+	if len(vector) == 0 {
+		return Result{}, fmt.Errorf("查询向量为空")
 	}
 	if opt.TopK <= 0 {
 		opt.TopK = 8
@@ -52,23 +90,8 @@ func (s *Service) Search(ctx context.Context, query string, opt Options) (Result
 		opt.CandidateK = opt.TopK * 4
 	}
 
-	// 1) 查询向量。
-	vecs, err := s.embedder.Embed(ctx, []string{query})
-	if err != nil {
-		s.recordUsage(ctx, store.UsageEvent{Kind: "embed", Model: s.embedModel, Status: "error"})
-		return Result{}, fmt.Errorf("查询向量化失败: %w", err)
-	}
-	if len(vecs) != 1 || len(vecs[0]) == 0 {
-		s.recordUsage(ctx, store.UsageEvent{Kind: "embed", Model: s.embedModel, Status: "error"})
-		return Result{}, fmt.Errorf("查询向量为空")
-	}
-	s.recordUsage(ctx, store.UsageEvent{
-		Kind: "embed", Model: s.embedModel, Chars: int64(len([]rune(query))),
-		Tokens: embedTokens(s.embedder, []string{query}), Status: "ok",
-	})
-
 	// 2) 向量召回候选。
-	hits, err := s.store.Search(ctx, vecs[0], opt.CandidateK)
+	hits, err := s.store.Search(ctx, vector, opt.CandidateK)
 	if err != nil {
 		return Result{}, err
 	}

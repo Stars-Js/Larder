@@ -18,7 +18,7 @@ import (
 )
 
 // Version 是应用版本号。
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // Overrides 是单个知识库可覆盖的全局设置（来自知识库设置）。
 type Overrides struct {
@@ -32,17 +32,18 @@ type Overrides struct {
 // App 是单个知识库的运行实例：持有该库的存储与编排服务。
 // 解析/向量/重排三个外部服务由共享的 services.Container 提供，可热更新。
 type App struct {
-	ID        string // 所属知识库 ID（单库模式下为空）
-	DBPath    string // 数据库文件路径
-	Cfg       config.Config
-	Store     store.Store
-	Ingest    *ingest.Service
-	Search    *search.Service
-	Embedder  embed.Embedder
-	Reranker  rerank.Reranker
-	Parser    parse.Parser
-	Logger    *slog.Logger
-	StartedAt time.Time
+	ID           string // 所属知识库 ID（单库模式下为空）
+	DBPath       string // 数据库文件路径
+	Cfg          config.Config
+	Store        store.Store
+	Ingest       *ingest.Service
+	Search       *search.Service
+	Embedder     embed.Embedder
+	Reranker     rerank.Reranker
+	Parser       parse.Parser
+	LayoutParser parse.Parser // 外部版面解析器（MinerU/Docling/Tika），可为 nil
+	Logger       *slog.Logger
+	StartedAt    time.Time
 }
 
 // New 依据配置构建 App（使用配置里的单库路径与一个私有服务容器）。
@@ -73,6 +74,12 @@ func NewAt(cfg config.Config, id, dbPath string, sc *services.Container, logger 
 			_ = st.Close()
 			return nil, nil, perr
 		}
+	}
+	// 外部版面解析器：Zotero 文献库需要保留标题层级、版式、表格与图片时使用。
+	layoutParser, lerr := services.BuildExternalParser(cfg)
+	if lerr != nil {
+		logger.Warn("构建版面解析器失败，将退回默认解析", "err", lerr)
+		layoutParser = nil
 	}
 
 	// 知识库可单独开关重排；开启但全局关闭时，若配置了端点则临时构建。
@@ -110,27 +117,31 @@ func NewAt(cfg config.Config, id, dbPath string, sc *services.Container, logger 
 	}
 
 	uploadDir := filepath.Join(cfg.Storage.Dir, ".uploads")
-	ing := ingest.New(st, parser, emb, chunkOpt, cfg.Embed.Endpoint.Model, rr != nil, uploadDir)
+	ing := ingest.New(st, parser, layoutParser, emb, chunkOpt, cfg.Embed.Endpoint.Model, rr != nil, uploadDir)
 	srch := search.New(st, emb, rr, cfg.Embed.Endpoint.Model, cfg.Rerank.Endpoint.Model)
 
 	a := &App{
-		ID:        id,
-		DBPath:    dbPath,
-		Cfg:       cfg,
-		Store:     st,
-		Ingest:    ing,
-		Search:    srch,
-		Embedder:  emb,
-		Reranker:  rr,
-		Parser:    parser,
-		Logger:    logger,
-		StartedAt: time.Now(),
+		ID:           id,
+		DBPath:       dbPath,
+		Cfg:          cfg,
+		Store:        st,
+		Ingest:       ing,
+		Search:       srch,
+		Embedder:     emb,
+		Reranker:     rr,
+		Parser:       parser,
+		LayoutParser: layoutParser,
+		Logger:       logger,
+		StartedAt:    time.Now(),
 	}
 	return a, func() { _ = st.Close() }, nil
 }
 
 // RerankEnabled 报告是否启用了重排。
 func (a *App) RerankEnabled() bool { return a.Reranker != nil }
+
+// HasLayoutParser 报告是否配置了外部版面解析器。
+func (a *App) HasLayoutParser() bool { return a.LayoutParser != nil }
 
 // EmbedDim 返回当前知识库已建立的向量维度；空库返回 0。
 func (a *App) EmbedDim() int {

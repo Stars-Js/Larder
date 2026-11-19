@@ -15,9 +15,10 @@ type OpenAI struct {
 	model  string
 	path   string
 
-	mu    sync.RWMutex
-	dim   int
-	usage Usage
+	mu      sync.RWMutex
+	embedMu sync.Mutex // 串行化请求，保证 LastUsage 不被并发调用覆盖
+	dim     int
+	usage   Usage
 	// batch 控制单次请求的文本数量，避免超出服务端限制。
 	batch int
 }
@@ -79,6 +80,10 @@ func (o *OpenAI) Embed(ctx context.Context, inputs []string) ([][]float32, error
 	if len(inputs) == 0 {
 		return nil, nil
 	}
+	// 并发同步 worker 会共享同一个 embedder；串行化请求，
+	// 避免 LastUsage 被其它调用重置，降低并发写入用量时的统计错乱。
+	o.embedMu.Lock()
+	defer o.embedMu.Unlock()
 
 	o.mu.Lock()
 	o.usage = Usage{}

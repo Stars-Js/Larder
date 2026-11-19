@@ -26,7 +26,7 @@ Larder 是一个**单 exe、数据保存在本机**的 RAG 桌面应用：
 - 回答可以带**文档名、文件、章节、原文和可点击的检索日志**，并支持按客户端定制引用格式；
 - Windows 下双击 exe 打开原生 WebView2 窗口，**不显示控制台**；关闭窗口后驻留托盘，MCP 继续运行。
 
-> 当前版本：**1.0.0**。默认监听 `127.0.0.1:8765`，MCP 端点为 `/mcp`。
+> 当前版本：**1.1.0**。默认监听 `127.0.0.1:8765`，MCP 端点为 `/mcp`。
 
 ---
 
@@ -55,9 +55,9 @@ Larder 是一个**单 exe、数据保存在本机**的 RAG 桌面应用：
 - **OpenAI 兼容服务**：向量化和重排都走标准 `/v1/embeddings`、`/v1/rerank`，可接 SiliconFlow、OpenAI、Ollama、Infinity、Xinference 等。
 - **多密钥 + 模型自选**：每个服务可保存多条密钥，支持复制、修改、删除、显示、逐条检测、切换当前密钥；模型自动拉取，也可手动选择。
 - **MCP 一键注入**：支持 Claude Code、Claude Desktop、Cursor、ZCode、Cherry Studio、DSH，并可取消注入；只增删 `larder` 条目，保留其它 MCP 配置。
-- **按平台定制引用**：Default / ZCode / Cherry Studio / Claude / Cursor / DSH 分别设置 Markdown 悬浮链接或纯文本；`cite`、日志、文档、文件、章节、原文均可勾选和排序。
+- **按平台定制引用**：Default / ZCode / Cherry Studio / Claude / Cursor / DSH 分别设置悬浮链接或纯文本；纯文本严格按参考文献格式输出，悬浮模式可勾选链接、文献词条、文献文件名、原文并排序。
 - **观测能力**：用量页统计解析次数、嵌入/重排 Token；日志页展示检索、入库、设置和 MCP 调用历史，命中片段可点开查看并跳转原文档。
-- **界面**：莫兰迪紫 + 毛玻璃磁贴、矢量 Logo、侧边栏动效；检索结果 Markdown 渲染并高亮关键词；支持 Markdown 原文、渲染、Chunks 和 PDF 原文预览。
+- **界面**：莫兰迪紫 + 分层毛玻璃、极光背景与太阳/月亮主题切换（亮色/暗色，选择会记住）；矢量 Logo、侧边栏动效；检索结果 Markdown 渲染并高亮关键词；支持 Markdown 原文、渲染、Chunks 和 PDF 原文预览。
 - **Windows 原生体验**：WebView2 内嵌窗口、系统 DPI 感知、任务栏/托盘常驻；缺少 WebView2 时自动回退到系统浏览器。
 
 ---
@@ -268,9 +268,15 @@ default / zcode / cherrystudio / claude-desktop / claude-code / cursor / dsh
 
 | 工具 | 作用 |
 | --- | --- |
-| `larder_use_kb` | 选择后续工具默认使用的知识库（在当前服务进程内生效） |
+| `larder_list_libraries` | 列出文献库（含 Zotero 集合、文档数、上次同步） |
+| `larder_select_library` | 首次问答时按会话选择文献库 |
+| `larder_use_kb` | 兼容旧名，等价于选择文献库 |
 | `larder_list_kbs` | 列出全部知识库及 ID、名称、文档数 |
-| `larder_search` | 语义检索；不指定 `kb` 时默认检索全部知识库 |
+| `larder_search` | 语义检索；未指定库且存在多个库时返回 `selection_required` |
+| `larder_get_references` | 按 GB/T 7714、APA、IEEE、Vancouver、MLA 生成参考文献 + BibTeX |
+| `larder_export_bibliography` | 导出 `.bib` 到 `data/exports/<kb>/`，同时返回内容 |
+| `larder_sync_library` | 触发 Zotero 文献库后台同步 |
+| `larder_library_status` | 查看同步任务进度与成功/失败数量 |
 | `larder_ingest_file` | 把本地文件解析、切块、向量化后加入知识库 |
 | `larder_ingest_url` | 抓取网页或在线文件并入库 |
 | `larder_list_documents` | 列出知识库中的文档 |
@@ -281,49 +287,152 @@ default / zcode / cherrystudio / claude-desktop / claude-code / cursor / dsh
 
 - 第一行的 Markdown 右对齐知识库小标（表格形式，兼容 Cherry Studio 等客户端）；
 - 每条命中片段的文档名、文件、章节、得分、原文；
-- 完整行内引用串（`cite_id` / `cite_link`）；
-- 本次检索的日志短链。
+- 每条结果附论文级引用串（`cite_id` / `cite_link`：悬浮模式为可点击链接，纯文本模式为参考文献规定的文内标记 `[1]` / `(作者, 年)`）；
+- 论文级 `references`：`ref_no`、`cite_mark`（悬浮和纯文本都使用标准文内标记，如 `[1]`）、`reference`、`bibtex`、`zotero_url`；
+- 可直接复制到回答末尾的 `reference_block`。
 
-> 写入类操作（入库、删除）必须指定知识库；检索类操作默认检索全部知识库，除非用户明确指定。
+首次检索时，如果存在多个文献库且用户尚未选择，支持 MCP elicitation 的客户端会**弹出可点击的文献库选项**：ZCode 等新协议客户端走 MRTR/InputRequests，Cherry Studio 等旧协议客户端走 elicitation/create；用户点击后，`larder_search` 自动继续检索。不支持 elicitation 的客户端会返回 `selection_required=true` 和库列表，agent 应把选项展示给用户，再调用 `larder_select_library`。
+后续检索建议同时带 `kb=<id>`，以兼容无会话状态的客户端。
+
+> 写入类操作（入库、删除）必须指定知识库；检索类操作在只有一个库时自动选择，多个库时先选择。
+
+**如何触发让用户选库：**
+
+1. 至少创建两个文献库/知识库（只有一个库时会自动选择，不会弹选项）。
+2. 新建一个 MCP 会话，调用 `larder_search` 且不带 `kb`；支持 elicitation 的客户端会直接弹出选项。
+3. 也可以主动调用 `larder_select_library` 且不传 `library`，同样会弹出选项。
+4. 旧客户端会收到 `selection_required=true` 和库列表；agent 把列表展示给用户，用户再调用 `larder_select_library(library="<id>")`。
+
+---
+
+## Zotero 文献库
+
+Larder 可以把 Zotero 的一个集合（文件夹）同步成独立知识库：
+
+1. 在 Zotero **设置 → 高级** 勾选「允许其他应用与 Zotero 通信」（推荐；未开启时自动回退到 `zotero.sqlite` 只读快照）。
+2. 打开 Larder 的「文献库」页。数据目录会**自动从 Zotero 的 `prefs.js` 读取并填入输入框**；读取不到时点「选择…」浏览文件夹或手动填写，然后点「检测集合」。
+3. 选择集合 → 创建文献库。Larder 会在后台逐篇读取元数据与全文，完成解析、切块、嵌入，并写入引用信息。
+4. 同步完成后可直接检索；MCP 首次检索会弹出文献库选项（旧客户端回退为列表）。
+5. Zotero 新增文献/附件后，Larder 默认监听 `zotero.sqlite`/`storage` 变化并自动增量同步。
+
+**文件不会重复复制**：PDF 仍留在 Zotero，Larder 只保存解析后的 Markdown、切块和向量；`documents.origin_path`
+指向原始 PDF，因此「打开 PDF」「重新处理」仍然可用。
+
+### 解析后的 Markdown
+
+`[zotero].md_mode` 控制落盘位置：
+
+| 模式 | 位置 |
+| --- | --- |
+| `storage`（默认） | `storage/<attachmentKey>/<论文标题>.md`，与 PDF 同目录 |
+| `larder` | `<Zotero 数据目录>/larder-md/<集合名>/<标题> [itemKey].md` |
+| `off` | 不写文件，只保存在知识库数据库中 |
+
+> `storage/` 由 Zotero 管理；写入 sidecar 可能被 Zotero 同步/配额策略影响。若只需要 Larder 检索，
+> 建议用 `off` 或 `larder`。
+
+`[zotero].parse_mode` 控制正文来源：
+
+| 模式 | 行为 |
+| --- | --- |
+| `auto`（默认） | 优先用 PDF 版面解析（MinerU/Docling），保留标题层级、版式、表格与图片；失败回退 Zotero 全文 |
+| `layout` | 强制 PDF 版面解析；失败即报错 |
+| `zotero` | 只用 Zotero 全文缓存，速度快，但为纯文本、无图片 |
+
+> 图片需要外部版面解析器（如 MinerU）。MinerU 结果里的 `images/` 会保存到
+> `data/.assets/<docID>/`，Markdown 预览通过 `/api/kbs/<kb>/documents/<doc>/assets/<name>` 显示。
+> 只用 Zotero 全文缓存时只有纯文本，没有版式和图片。
+
+### 引用与参考文献
+
+- 参考文献格式：`gb-t-7714-numeric`（默认）、`gb-t-7714-author-date`、`apa`、`ieee`、`vancouver`、`mla`，在「设置 → 引用格式」按客户端 / agent 分别配置。
+- 文内标记由参考文献格式决定：GB/T、IEEE 用 `[1]`，Vancouver 用 `(1)`，APA/MLA 用作者-年份；悬浮和纯文本使用同一套标准文内标记。
+- 引用显示方式在「设置 → 引用格式」按客户端配置：
+  - 悬浮链接：正文显示标准文内标记；链接可选且固定第一项，悬停按勾选顺序显示悬浮内容；
+  - 纯文本：正文只显示标准文内标记，不附加链接、文献词条、文件名或原文；文末输出完整参考文献；
+  - 两种模式都会在回答末尾输出参考文献列表，或调用工具生成 `.bib`。
+- 悬浮内容字段：`link`（链接）、`reference`（文献词条）、`file`（文献文件名）、`text`（原文）。仅悬浮模式需要设置；链接固定第一项，其余可排序。
+- 设置页预览：悬浮模式显示「正文预览 / 悬浮预览 / 文末参考文献预览」；纯文本模式只显示「正文预览 / 文末参考文献预览」。
+- 「参考文献格式」已放到「设置 → 引用格式」，每个客户端 / agent 独立保存；切换平台不会覆盖其他平台的格式。旧配置的全局格式会作为各平台初始值迁移。
+- `larder_search` 会把同一篇论文的多个 chunk 去重成一个编号，并返回 `reference_block`。
+- `larder_get_references` 可按样式重新生成参考文献和 BibTeX。
+- `larder_export_bibliography` 写入 `data/exports/<kb>/references.bib`；也可直接访问
+  `GET /api/kbs/<kb>/bibliography.bib` 下载。
+- Markdown 客户端里的 `[1]` 链接指向 `/r/<kb>/<doc>` 引用卡片；卡片里的「在 Zotero 中打开」「打开 PDF」
+  使用 `zotero://select/...` 与 `zotero://open-pdf/...?page=N` 深链。
+
+### 常用接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET/PUT` | `/api/zotero/settings` | 读取/保存 Zotero 联动设置 |
+| `GET` | `/api/zotero/collections` | 读取集合树（`data_dir` / `api_base` 可覆盖） |
+| `POST` | `/api/zotero/libraries` | 从集合创建文献库（可 `sync_now`） |
+| `GET` | `/api/kbs/{kb}/zotero/status` | 同步状态、成功/失败数量、最近任务 |
+| `POST` | `/api/kbs/{kb}/zotero/sync` | 触发后台同步 |
+| `GET` | `/api/kbs/{kb}/library-items` | 文献元数据列表 |
+| `GET` | `/api/kbs/{kb}/references?doc_ids=...&style=...` | 参考文献 Markdown + BibTeX |
+| `GET` | `/api/kbs/{kb}/bibliography.bib` | 下载 `.bib` |
+| `GET` | `/r/{kb}/{doc}` | 引用卡片（悬浮链接点击进入） |
+| `GET` | `/z/{kb}/{doc}` | 302 → `zotero://select/...` |
+| `GET` | `/p/{kb}/{doc}?page=N` | 302 → `zotero://open-pdf/...?page=N` |
+
+### 同步说明
+
+- 默认按 Zotero `dateModified` 增量同步；内容未变会跳过。
+- 默认监听 `zotero.sqlite` / `-wal` / `storage` 的修改时间：Zotero 拉入新文献或附件后，Larder 会自动触发同步（`watch = true`，默认 5 秒检测一次）。
+- 启动时会先做一次增量同步，覆盖 Larder 关闭期间新增的文献。
+- 已删除/移出集合的条目暂不自动删除索引，避免误删；可在文档页手动删除。
+- 首次同步大量论文会消耗 embedding Token；建议先在设置里确认向量服务，或先用一个小集合试跑。
+- 换 embedding 模型会触发维度冲突；需要新建文献库或重建向量索引。
 
 ---
 
 ## 引用格式
 
-「设置 → 引用格式」可以按平台分别配置。每个平台支持两种显示方式：
+「设置 → 引用格式」先选择客户端 / agent，再分别设置该平台的参考文献格式和显示方式。
 
-### Markdown 悬浮链接
+### 悬浮链接
 
-```markdown
-[[cite:id]](http://127.0.0.1:8765/c/<event> "【文档】…【文件】…【章节】…【原文】…")
+正文显示**参考文献标准文内标记**：
+
+```text
+[1]       或       (Smith, 2020)
 ```
 
-正文显示 `[cite:id]`；鼠标悬停可看来源字段；点击打开本次检索日志。
+链接是可选字段，固定为第一项且不可调序；取消勾选“链接”后只显示文内标记，不再生成超链接，因此也没有悬停内容。
+悬停内容按其余勾选字段的顺序显示（用户可勾选并上下排序）：
+
+```text
+【文献词条】Smith, J. ... [J]. Journal, 2020.
+【文献文件名】paper.pdf
+【原文】……
+```
+
+点击打开 `/r/<kb>/<doc>` 引用卡片。设置页同时显示正文预览、悬浮预览和文末参考文献预览。
 
 ### 纯文本
 
+正文只显示参考文献标准规定的文内标记：
+
 ```text
-[cite:id]（【日志】http://127.0.0.1:8765/c/<event>；【文档】…【文件】…【章节】…【原文】…）
+[1]       或       (Smith, 2020)       或       (1)
 ```
 
-适合会移除 Markdown 链接的客户端。ZCode 固定使用纯文本模式。
+纯文本模式不提供悬浮内容设置，也不会在行内附加链接、文献词条、文件名或原文；完整参考文献统一输出在文末。设置页只显示正文预览和文末参考文献预览。
 
-### 字段规则
+ZCode 固定使用纯文本模式（客户端会移除 Markdown 链接），正文同样使用标准文内标记。
 
-- **引用标记 `cite`**：可选；启用时始终在第一位。
-- **日志 `log`**：可选；启用时固定在括号内第一位。取消勾选后不输出日志链接，但仍保留来源字段。
-- **来源字段**：文档、文件、章节、原文，可勾选并上下排序。
+### 共同规则
+
+- **两种模式都会在回答末尾输出完整参考文献列表**，或调用 `larder_export_bibliography` 生成 `.bib` 文件。
+- 悬浮内容字段：`link`（链接）、`reference`（文献词条）、`file`（文献文件名）、`text`（原文）。仅悬浮模式需要设置。
+- 文内标记只由参考文献格式决定：GB/T、IEEE 用 `[1]`，Vancouver 用 `(1)`，APA/MLA 用作者-年份；两种模式一致。
 - 修改后自动保存并立即生效；首次为某个平台接入时，需要在该客户端重新注入一次 MCP 地址，使 URL 带上 `?client=<平台>`。
 
 ### ZCode 特别说明
 
-ZCode 不会把 MCP 服务的 `instructions` 传给模型，且可能只复制结构化结果里的 `cite_id`。因此 Larder 对 ZCode：
-
-- 固定使用纯文本引用；
-- 让 `cite_id` 与 `cite_link` 都返回**完整引用串**（含括号内的日志与来源）；
-- 在工具描述和检索结果末尾明确要求逐字复制完整引用，禁止只输出 `[cite:id]`。
-
-更新 Larder 后，请**新建一个 ZCode 会话**（或重启 ZCode）再测试，避免旧会话缓存旧的工具描述。
+ZCode 会移除 Markdown 链接，因此固定使用纯文本引用（数字格式仍为 `[1]`）。更新 Larder 后，请**新建一个 ZCode 会话**（或重启 ZCode）再测试，避免旧会话缓存旧的工具描述。
 
 ---
 
@@ -509,7 +618,7 @@ Larder 会本地优先解析；本地读不到时自动上传 MinerU 做 OCR。
 
 请确认：
 
-1. 使用当前版本（1.0.0+）；
+1. 使用当前版本（1.1.0+）；
 2. ZCode 的 Larder URL 带 `?client=zcode`；
 3. **新建一个 ZCode 会话**或重启 ZCode，让模型重新加载工具描述；
 4. 必要时在 Larder 设置里重新点一次「一键注入」。
@@ -575,7 +684,10 @@ Larder 会本地优先解析；本地读不到时自动上传 MinerU 做 OCR。
 │   │   └── rerank/             # OpenAI 兼容 rerank
 │   ├── ingest/                 # 入库编排：判重→解析→切块→向量化→落库→重试
 │   ├── search/                 # 检索编排：向量召回→重排→TopK
-│   ├── mcp/                    # MCP 工具、引用格式、日志短链
+│   ├── zotero/                 # Zotero 本地 API + zotero.sqlite 只读快照
+│   ├── library/                # Zotero 集合→知识库同步、MD sidecar、同步任务
+│   ├── cite/                   # GB/T 7714、APA、IEEE、Vancouver、BibTeX
+│   ├── mcp/                    # MCP 工具、选库、论文级引用、日志短链
 │   ├── api/                    # REST 接口、MCP 注入、设置、用量、日志
 │   ├── activity/               # 交互日志与命中片段
 │   ├── web/                    # 内嵌前端（go:embed + SPA 回退）

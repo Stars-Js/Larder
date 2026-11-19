@@ -26,7 +26,7 @@ func Handler(d Deps) http.Handler {
 
 	// MCP 服务端（Streamable HTTP）。始终挂载，但按当前配置动态启停：
 	// 关闭时返回 404，设置里切换后立即生效，无需重启进程。
-	mcpSrv := mcp.New(d.Manager, d.API.MCPURL, d.Activity)
+	mcpSrv := mcp.New(d.Manager, d.API.Library, d.API.MCPURL, d.Activity)
 	mcpHandler := mcpSrv.Handler()
 	root.Handle(d.MCPPath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !d.API.Services.Config().Server.MCPEnabled {

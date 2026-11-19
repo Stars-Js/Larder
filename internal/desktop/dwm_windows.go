@@ -3,6 +3,7 @@
 package desktop
 
 import (
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -26,7 +27,7 @@ var (
 
 // 与前端 app.css 中 --bg / --fg 保持一致，让标题栏与页面融为一体。
 var (
-	lightCaption = rgb(0xee, 0xea, 0xf5) // --bg（浅色）
+	lightCaption = rgb(0xf8, 0xf5, 0xfc) // --bg（浅色）
 	lightText    = rgb(0x2a, 0x24, 0x35) // --fg（浅色）
 	darkCaption  = rgb(0x17, 0x14, 0x1f) // --bg（深色）
 	darkText     = rgb(0xf2, 0xee, 0xf8) // --fg（深色）
@@ -55,13 +56,55 @@ func isDarkMode() bool {
 	return v == 0 // 0 = 深色
 }
 
+var (
+	windowThemeMu   sync.RWMutex
+	windowThemeHWND uintptr
+	windowThemeDark bool
+)
+
+// SetTheme 把原生标题栏切换到应用当前选择的亮/暗主题。
+// 由前端在主题初始化或点击太阳/月亮时调用。
+func SetTheme(dark bool) {
+	windowThemeMu.Lock()
+	windowThemeDark = dark
+	hwnd := windowThemeHWND
+	windowThemeMu.Unlock()
+	if hwnd != 0 {
+		tintTitleBar(hwnd, dark)
+	}
+}
+
+func registerWindow(hwnd uintptr, dark bool) {
+	windowThemeMu.Lock()
+	windowThemeHWND = hwnd
+	windowThemeDark = dark
+	windowThemeMu.Unlock()
+	if hwnd != 0 {
+		tintTitleBar(hwnd, dark)
+	}
+}
+
+func unregisterWindow(hwnd uintptr) {
+	windowThemeMu.Lock()
+	if windowThemeHWND == hwnd {
+		windowThemeHWND = 0
+	}
+	windowThemeMu.Unlock()
+}
+
+func refreshWindowTheme(hwnd uintptr) {
+	windowThemeMu.RLock()
+	dark := windowThemeDark
+	windowThemeMu.RUnlock()
+	tintTitleBar(hwnd, dark)
+}
+
 // tintTitleBar 把原生标题栏涂成页面自身的背景色，并让标题文字与之协调，
 // 效果与 magpie 在 Windows 上的标题栏一致：栏与页面读作同一块表面。
-func tintTitleBar(hwnd uintptr) {
+func tintTitleBar(hwnd uintptr, dark bool) {
 	if hwnd == 0 {
 		return
 	}
-	dark := isDarkMode()
 
 	// 深色/浅色沉浸式标题栏（决定最小化/最大化/关闭按钮图标明暗）。
 	var immersive int32

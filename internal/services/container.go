@@ -113,23 +113,34 @@ func DetectParseProvider(baseURL string) string {
 // 普通文本和文字版 PDF 仍在本地完成，扫描件、矢量图形 PDF、复杂版式才上传
 // 到外部服务——这样配置一次外部服务即可覆盖所有文件，而不会把所有文本都上传。
 func BuildParser(cfg config.Config) (parse.Parser, error) {
-	e := cfg.Parse.Endpoint
+	ext, err := BuildExternalParser(cfg)
+	if err != nil {
+		return nil, err
+	}
 	local := parse.NewPlain()
+	if ext == nil {
+		return local, nil
+	}
+	return parse.NewHybrid(local, ext), nil
+}
+
+// BuildExternalParser 直接构造外部版面解析器（MinerU / Docling / Tika），
+// 不包“本地优先”的 Hybrid。用于 Zotero 等需要保留标题层级、表格和图片的场景。
+func BuildExternalParser(cfg config.Config) (parse.Parser, error) {
+	e := cfg.Parse.Endpoint
 	switch cfg.Parse.Provider {
 	case "", "plain":
-		return local, nil
+		return nil, nil
 	case "mineru":
 		m := parse.NewMinerU(e.BaseURL, e.APIKey, e.Path, e.Timeout.Std(), e.MaxRetries, e.QPS)
 		if e.Model != "" {
 			m.WithModelVersion(e.Model)
 		}
-		return parse.NewHybrid(local, m), nil
+		return m, nil
 	case "docling":
-		d := parse.NewDocling(e.BaseURL, e.APIKey, e.Path, e.Timeout.Std(), e.MaxRetries, e.QPS)
-		return parse.NewHybrid(local, d), nil
+		return parse.NewDocling(e.BaseURL, e.APIKey, e.Path, e.Timeout.Std(), e.MaxRetries, e.QPS), nil
 	case "tika":
-		t := parse.NewTika(e.BaseURL, e.APIKey, e.Path, e.Timeout.Std(), e.MaxRetries, e.QPS)
-		return parse.NewHybrid(local, t), nil
+		return parse.NewTika(e.BaseURL, e.APIKey, e.Path, e.Timeout.Std(), e.MaxRetries, e.QPS), nil
 	default:
 		return nil, fmt.Errorf("未知的 parse.provider: %q（可选 plain/mineru/docling/tika）", cfg.Parse.Provider)
 	}

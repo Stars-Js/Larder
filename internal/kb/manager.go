@@ -45,6 +45,12 @@ type Info struct {
 	EmbeddedDocs int    `json:"embedded_docs"`           // 嵌入成功的文档数
 	PendingDocs  int    `json:"pending_docs"`            // 待处理（进行中）
 	FailedDocs   int    `json:"failed_docs"`             // 解析或嵌入失败
+
+	// Zotero 文献库信息。
+	Kind             string `json:"kind,omitempty"`              // manual / zotero
+	ZoteroCollection string `json:"zotero_collection,omitempty"` // 集合名称
+	ZoteroDataDir    string `json:"zotero_data_dir,omitempty"`   // Zotero 数据目录
+	LastSync         string `json:"last_sync,omitempty"`         // 最近同步时间
 }
 
 // Manager 负责知识库的创建、列举、打开与删除。
@@ -216,6 +222,9 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("删除知识库文件失败: %w", err)
 	}
+	// WAL 模式会生成 -wal/-shm，一并清理。
+	_ = os.Remove(p + "-wal")
+	_ = os.Remove(p + "-shm")
 	return nil
 }
 
@@ -270,7 +279,7 @@ func (m *Manager) info(ctx context.Context, id string, a *app.App) (Info, error)
 }
 
 func (m *Manager) infoFromStore(ctx context.Context, id, path string, st store.Store) (Info, error) {
-	docs, err := st.ListDocuments(ctx)
+	stats, err := st.Stats(ctx)
 	if err != nil {
 		return Info{}, err
 	}
@@ -285,30 +294,10 @@ func (m *Manager) infoFromStore(ctx context.Context, id, path string, st store.S
 	if !ok || name == "" {
 		name = id
 	}
-	var created time.Time
-	if len(docs) > 0 {
-		// 以最早文档近似创建时间；无文档时用文件修改时间。
-		created = docs[len(docs)-1].CreatedAt
-	}
+	created := stats.CreatedAt
 	if created.IsZero() {
 		if fi, err := os.Stat(path); err == nil {
 			created = fi.ModTime()
-		}
-	}
-
-	// 汇总各文档处理状态。
-	parsed, embedded, pending, failed := 0, 0, 0, 0
-	for _, d := range docs {
-		if d.ParseStatus == "ok" {
-			parsed++
-		}
-		if d.EmbedStatus == "ok" {
-			embedded++
-		}
-		if d.ParseStatus == "error" || d.EmbedStatus == "error" {
-			failed++
-		} else if d.ParseStatus != "ok" || d.EmbedStatus != "ok" {
-			pending++
 		}
 	}
 
@@ -321,16 +310,21 @@ func (m *Manager) infoFromStore(ctx context.Context, id, path string, st store.S
 	if eff.RerankEnabled != nil && *eff.RerankEnabled {
 		rerankStatus = "on"
 	}
+	kind, _, _ := st.GetMeta(ctx, "kb_kind")
+	zoteroCollection, _, _ := st.GetMeta(ctx, "zotero_collection_name")
+	zoteroDataDir, _, _ := st.GetMeta(ctx, "zotero_data_dir")
+	lastSync, _, _ := st.GetMeta(ctx, "zotero_last_sync")
 
 	return Info{
 		ID: id, Name: name, Path: path,
-		Documents: len(docs), Chunks: chunks, Dim: st.Dim(), CreatedAt: created,
+		Documents: stats.Total, Chunks: chunks, Dim: st.Dim(), CreatedAt: created,
 		ParseMethod:  eff.ParseProvider,
 		EmbedModel:   cfg.Embed.Endpoint.Model,
 		EmbedDim:     st.Dim(),
 		RerankStatus: rerankStatus,
 		RerankModel:  cfg.Rerank.Endpoint.Model,
-		ParsedDocs:   parsed, EmbeddedDocs: embedded, PendingDocs: pending, FailedDocs: failed,
+		ParsedDocs:   stats.Parsed, EmbeddedDocs: stats.Embedded, PendingDocs: stats.Pending, FailedDocs: stats.Failed,
+		Kind: kind, ZoteroCollection: zoteroCollection, ZoteroDataDir: zoteroDataDir, LastSync: lastSync,
 	}, nil
 }
 

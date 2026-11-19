@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 	"time"
 
@@ -222,12 +223,15 @@ func (m *MinerU) parseCloud(ctx context.Context, in Input) (Result, error) {
 		return Result{}, err
 	}
 
-	// 4) 下载结果 zip，取出 full.md。
-	md, err := m.fetchMarkdown(ctx, zipURL)
+	// 4) 下载结果 zip，取出 full.md 与 images/。
+	md, images, err := m.fetchMarkdown(ctx, zipURL)
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Markdown: md, Title: inferTitle(md, name), MIME: "text/markdown", Method: m.Name(), Note: "MinerU 云 API"}, nil
+	return Result{
+		Markdown: md, Title: inferTitle(md, name), MIME: "text/markdown",
+		Method: m.Name(), Note: "MinerU 云 API", Images: images,
+	}, nil
 }
 
 type mineruBatchResult struct {
@@ -301,22 +305,27 @@ func (m *MinerU) pollBatch(ctx context.Context, batchID, fileName string) (strin
 	}
 }
 
-// fetchMarkdown 下载结果 zip 并取出其中的 full.md。
-func (m *MinerU) fetchMarkdown(ctx context.Context, zipURL string) (string, error) {
+// fetchMarkdown 下载结果 zip，取出 full.md 与 images/ 下的图片。
+func (m *MinerU) fetchMarkdown(ctx context.Context, zipURL string) (string, []Image, error) {
 	// 结果 zip 在对象存储（OSS/COS）上，刚完成轮询时立即下载容易触发 QPS 限流，
 	// 稍等片刻再取；真正的限流由 httpx.GetBytes 的退避重试兜底。
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return "", nil, ctx.Err()
 	case <-time.After(time.Second):
 	}
 	data, err := m.client.GetBytes(ctx, zipURL, 512<<20)
 	if err != nil {
-		return "", fmt.Errorf("mineru: 下载结果失败: %w", err)
+		return "", nil, fmt.Errorf("mineru: 下载结果失败: %w", err)
 	}
+	return parseMinerUZip(data)
+}
+
+// parseMinerUZip 从 MinerU 结果 zip 中读取 full.md 和 images/ 下的图片。
+func parseMinerUZip(data []byte) (string, []Image, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return "", fmt.Errorf("mineru: 结果压缩包无法读取: %w", err)
+		return "", nil, fmt.Errorf("mineru: 结果压缩包无法读取: %w", err)
 	}
 
 	// 优先 full.md，其次任意 .md。
@@ -332,22 +341,70 @@ func (m *MinerU) fetchMarkdown(ctx context.Context, zipURL string) (string, erro
 		}
 	}
 	if mdFile == nil {
-		return "", fmt.Errorf("mineru: 结果压缩包中未找到 markdown 文件")
+		return "", nil, fmt.Errorf("mineru: 结果压缩包中未找到 markdown 文件")
 	}
 	rc, err := mdFile.Open()
 	if err != nil {
-		return "", fmt.Errorf("mineru: 读取 markdown 失败: %w", err)
+		return "", nil, fmt.Errorf("mineru: 读取 markdown 失败: %w", err)
 	}
-	defer rc.Close()
 	md, err := io.ReadAll(io.LimitReader(rc, 64<<20))
+	rc.Close()
 	if err != nil {
-		return "", fmt.Errorf("mineru: 读取 markdown 失败: %w", err)
+		return "", nil, fmt.Errorf("mineru: 读取 markdown 失败: %w", err)
 	}
 	out := strings.TrimSpace(string(md))
 	if out == "" {
-		return "", fmt.Errorf("mineru: markdown 内容为空")
+		return "", nil, fmt.Errorf("mineru: markdown 内容为空")
 	}
-	return out, nil
+
+	// 抽取 images/ 下的图片；总大小上限 200MB，单张 30MB。
+	var images []Image
+	var total int64
+	for _, f := range zr.File {
+		name := f.Name
+		lower := strings.ToLower(name)
+		if !strings.Contains(lower, "images/") || strings.HasSuffix(lower, "/") {
+			continue
+		}
+		ext := strings.ToLower(path.Ext(name))
+		mime := imageMIME(ext)
+		if mime == "" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		b, err := io.ReadAll(io.LimitReader(rc, 30<<20))
+		rc.Close()
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		total += int64(len(b))
+		if total > 200<<20 || len(images) >= 300 {
+			break
+		}
+		images = append(images, Image{Name: path.Base(name), Data: b, MIME: mime})
+	}
+	return out, images, nil
+}
+
+func imageMIME(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".bmp":
+		return "image/bmp"
+	}
+	return ""
 }
 
 func firstNonEmpty(vals ...string) string {

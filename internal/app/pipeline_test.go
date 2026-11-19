@@ -58,7 +58,7 @@ func setup(t *testing.T) (store.Store, *ingest.Service, *search.Service) {
 	t.Cleanup(func() { st.Close() })
 
 	emb := &fakeEmbedder{dim: 2}
-	ing := ingest.New(st, parse.NewPlain(), emb, chunk.Options{MaxRunes: 400, Overlap: 40, MinRunes: 10}, "fake-embed", false, t.TempDir())
+	ing := ingest.New(st, parse.NewPlain(), nil, emb, chunk.Options{MaxRunes: 400, Overlap: 40, MinRunes: 10}, "fake-embed", false, t.TempDir())
 	srch := search.New(st, emb, nil, "fake-embed", "")
 	return st, ing, srch
 }

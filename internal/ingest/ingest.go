@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,6 +31,7 @@ const maxSourceBytes = 200 << 20
 type Service struct {
 	store         store.Store
 	parser        parse.Parser
+	layoutParser  parse.Parser // 外部版面解析器；PreferExternal 时优先使用
 	embedder      embed.Embedder
 	chunkOpt      chunk.Options
 	embedModel    string
@@ -39,11 +42,12 @@ type Service struct {
 
 // New 创建入库服务。embedModel 仅用于记录（展示向量化所用模型），
 // rerankEnabled 表示入库时是否启用重排，写入文档状态；uploadDir 用于缓存上传原文件，
-// 便于解析失败后配置好服务再“重新处理”。
-func New(st store.Store, parser parse.Parser, embedder embed.Embedder, chunkOpt chunk.Options, embedModel string, rerankEnabled bool, uploadDir string) *Service {
+// 便于解析失败后配置好服务再“重新处理”。layoutParser 可为 nil。
+func New(st store.Store, parser, layoutParser parse.Parser, embedder embed.Embedder, chunkOpt chunk.Options, embedModel string, rerankEnabled bool, uploadDir string) *Service {
 	return &Service{
 		store:         st,
 		parser:        parser,
+		layoutParser:  layoutParser,
 		embedder:      embedder,
 		chunkOpt:      chunkOpt,
 		embedModel:    embedModel,
@@ -57,6 +61,9 @@ func New(st store.Store, parser parse.Parser, embedder embed.Embedder, chunkOpt 
 type Options struct {
 	Title   string // 可选，覆盖自动推断的标题
 	Refresh bool   // true 时即使内容未变也重新入库
+	// PreferExternal 为 true 且配置了外部版面解析器时，优先用它解析 PDF，
+	// 以保留标题层级、版式、表格与图片。
+	PreferExternal bool
 	// 以下字段由服务内部在“重新处理”时使用。
 	DocID      string
 	OriginPath string
@@ -237,9 +244,78 @@ func (s *Service) cacheUpload(data []byte, fileName string) (string, error) {
 	return p, nil
 }
 
-func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string, data []byte, opt Options) (Result, error) {
-	if len(data) == 0 {
+// ingestPrep 保存判重与 pending 落库后的中间状态，供“解析后”和“直接 Markdown”复用。
+type ingestPrep struct {
+	docID        string
+	title        string
+	originPath   string
+	originType   string
+	rawHash      string
+	rerankStatus string
+	oldChunks    int
+	existing     model.Document
+	optTitle     string
+	parserName   string
+}
+
+// IngestMarkdown 直接入库一段已经解析好的 Markdown（例如 Zotero 全文缓存），
+// 跳过文件解析，但仍执行判重、切块、向量化与落库。
+func (s *Service) IngestMarkdown(ctx context.Context, source, fileName, mime, markdown string, opt Options) (Result, error) {
+	if strings.TrimSpace(markdown) == "" {
 		return Result{}, fmt.Errorf("来源内容为空: %s", source)
+	}
+	prep, skipped, err := s.prepareIngest(ctx, source, fileName, mime, []byte(markdown), opt)
+	if err != nil {
+		return Result{}, err
+	}
+	if skipped != nil {
+		return *skipped, nil
+	}
+	parsed := parse.Result{
+		Markdown: markdown,
+		Title:    firstNonEmpty(opt.Title, prep.existing.Title, fileStem(fileName)),
+		MIME:     "text/markdown",
+		Method:   "zotero",
+		Note:     "Zotero 全文缓存",
+	}
+	return s.ingestParsed(ctx, source, fileName, prep, parsed)
+}
+
+func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string, data []byte, opt Options) (Result, error) {
+	prep, skipped, err := s.prepareIngest(ctx, source, fileName, mime, data, opt)
+	if err != nil {
+		return Result{}, err
+	}
+	if skipped != nil {
+		return *skipped, nil
+	}
+
+	// 解析为 Markdown。Zotero 文献库可选择外部版面解析器，
+	// 以保留标题层级、版式、表格与图片。
+	parser := s.parser
+	if opt.PreferExternal && s.layoutParser != nil {
+		parser = s.layoutParser
+	}
+	parsed, err := parser.Parse(ctx, parse.Input{
+		FileName: fileName,
+		MIME:     mime,
+		Data:     data,
+	})
+	if err != nil {
+		s.recordUsage(ctx, store.UsageEvent{Kind: "parse", Model: parser.Name(), Status: "error"})
+		return s.failParse(ctx, source, prep, err)
+	}
+	if strings.TrimSpace(parsed.Markdown) == "" {
+		s.recordUsage(ctx, store.UsageEvent{Kind: "parse", Model: parser.Name(), Status: "error"})
+		return s.failParse(ctx, source, prep, fmt.Errorf("解析结果为空"))
+	}
+	return s.ingestParsed(ctx, source, fileName, prep, parsed)
+}
+
+// prepareIngest 做空内容校验、判重、复用失败记录，并先落一条 pending 文档。
+func (s *Service) prepareIngest(ctx context.Context, source, fileName, mime string, data []byte, opt Options) (*ingestPrep, *Result, error) {
+	if len(data) == 0 {
+		return nil, nil, fmt.Errorf("来源内容为空: %s", source)
 	}
 
 	rawHash := hashBytes(data)
@@ -254,19 +330,20 @@ func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string
 	if opt.DocID != "" {
 		doc, ok, err := s.store.GetDocument(ctx, opt.DocID)
 		if err != nil {
-			return Result{}, err
+			return nil, nil, err
 		}
 		if !ok {
-			return Result{}, fmt.Errorf("文档不存在: %s", opt.DocID)
+			return nil, nil, fmt.Errorf("文档不存在: %s", opt.DocID)
 		}
 		existing, hasExisting = doc, true
 	}
 	if !hasExisting && !opt.Refresh {
 		if doc, ok, err := s.store.FindDocByHash(ctx, source, rawHash); err != nil {
-			return Result{}, err
+			return nil, nil, err
 		} else if ok {
 			if doc.ParseStatus == "ok" && doc.EmbedStatus == "ok" {
-				return resultFromDoc(doc, true, "内容未变化，已跳过"), nil
+				res := resultFromDoc(doc, true, "内容未变化，已跳过")
+				return nil, &res, nil
 			}
 			existing, hasExisting = doc, true
 		}
@@ -274,7 +351,7 @@ func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string
 	if !hasExisting && !opt.Refresh {
 		// 同一来源上次处理失败（或内容已变化但旧版本失败）时复用该记录。
 		if doc, ok, err := s.store.FindDocBySource(ctx, source); err != nil {
-			return Result{}, err
+			return nil, nil, err
 		} else if ok && (doc.ParseStatus != "ok" || doc.EmbedStatus != "ok") {
 			existing, hasExisting = doc, true
 		}
@@ -290,57 +367,68 @@ func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string
 	oldChunks := existing.Chunks
 
 	// 先落一条 pending 记录，让前端立刻看到“处理中”的文件与环节状态。
+	parserName := s.parser.Name()
+	if opt.PreferExternal && s.layoutParser != nil {
+		parserName = s.layoutParser.Name()
+	}
 	pending := store.Document{
 		ID: docID, Source: source, Title: title, MIME: mime, Hash: rawHash, Chunks: oldChunks,
-		ParseStatus: "running", ParseMethod: s.parser.Name(), ParseNote: "",
+		ParseStatus: "running", ParseMethod: parserName, ParseNote: "",
 		EmbedStatus: "pending", EmbedModel: s.embedModel, EmbedDim: existing.EmbedDim,
 		RerankStatus: rerankStatus, OriginPath: originPath, OriginType: originType,
 	}
 	if err := s.store.UpsertDocument(ctx, pending); err != nil {
-		return Result{}, err
+		return nil, nil, err
 	}
+	return &ingestPrep{
+		docID: docID, title: title, originPath: originPath, originType: originType,
+		rawHash: rawHash, rerankStatus: rerankStatus, oldChunks: oldChunks,
+		existing: existing, optTitle: opt.Title, parserName: parserName,
+	}, nil, nil
+}
 
-	failParse := func(err error) (Result, error) {
-		st := store.DocStatus{
-			ParseStatus: "error", ParseMethod: s.parser.Name(), ParseNote: err.Error(),
-			EmbedStatus: "pending", EmbedModel: s.embedModel, EmbedNote: "", EmbedDim: existing.EmbedDim,
-			RerankStatus: rerankStatus, Chunks: oldChunks,
+// failParse 记录解析失败状态。
+func (s *Service) failParse(ctx context.Context, source string, prep *ingestPrep, err error) (Result, error) {
+	st := store.DocStatus{
+		ParseStatus: "error", ParseMethod: prep.parserName, ParseNote: err.Error(),
+		EmbedStatus: "pending", EmbedModel: s.embedModel, EmbedNote: "", EmbedDim: prep.existing.EmbedDim,
+		RerankStatus: prep.rerankStatus, Chunks: prep.oldChunks,
+	}
+	_ = s.store.SetDocumentStatus(ctx, prep.docID, st)
+	return Result{
+		DocID: prep.docID, Title: prep.title, Source: source, Chunks: prep.oldChunks,
+		ParseStatus: "error", ParseMethod: st.ParseMethod, ParseNote: st.ParseNote,
+		EmbedStatus: "pending", EmbedModel: s.embedModel, EmbedDim: prep.existing.EmbedDim, RerankStatus: prep.rerankStatus,
+	}, fmt.Errorf("解析失败: %w", err)
+}
+
+// ingestParsed 执行切块 → 嵌入 → 落库，供文件解析和直接 Markdown 两条路径共用。
+func (s *Service) ingestParsed(ctx context.Context, source, fileName string, prep *ingestPrep, parsed parse.Result) (Result, error) {
+	title := firstNonEmpty(prep.optTitle, parsed.Title, prep.existing.Title, fileStem(fileName))
+	method := firstNonEmpty(parsed.Method, prep.parserName, s.parser.Name())
+
+	// 保存解析器抽出的图片，并把 Markdown 里的 images/xxx 改写成 asset://xxx。
+	markdown := parsed.Markdown
+	imageNote := ""
+	if len(parsed.Images) > 0 {
+		if rewritten, ierr := s.saveImages(prep.docID, markdown, parsed.Images); ierr == nil {
+			markdown = rewritten
+		} else {
+			imageNote = "；图片保存失败"
 		}
-		_ = s.store.SetDocumentStatus(ctx, docID, st)
-		return Result{
-			DocID: docID, Title: title, Source: source, Chunks: oldChunks,
-			ParseStatus: "error", ParseMethod: st.ParseMethod, ParseNote: st.ParseNote,
-			EmbedStatus: "pending", EmbedModel: s.embedModel, EmbedDim: existing.EmbedDim, RerankStatus: rerankStatus,
-		}, fmt.Errorf("解析失败: %w", err)
 	}
-
-	// 解析为 Markdown。
-	parsed, err := s.parser.Parse(ctx, parse.Input{
-		FileName: fileName,
-		MIME:     mime,
-		Data:     data,
-	})
-	if err != nil {
-		s.recordUsage(ctx, store.UsageEvent{Kind: "parse", Model: s.parser.Name(), Status: "error"})
-		return failParse(err)
-	}
-	if strings.TrimSpace(parsed.Markdown) == "" {
-		s.recordUsage(ctx, store.UsageEvent{Kind: "parse", Model: s.parser.Name(), Status: "error"})
-		return failParse(fmt.Errorf("解析结果为空"))
-	}
-	method := firstNonEmpty(parsed.Method, s.parser.Name())
-	title = firstNonEmpty(opt.Title, parsed.Title, existing.Title, fileStem(fileName))
-	parseChars := int64(len([]rune(parsed.Markdown)))
+	parseChars := int64(len([]rune(markdown)))
 	parseNote := fmt.Sprintf("%d 字符", parseChars)
 	if parsed.Note != "" {
 		parseNote = parsed.Note + "；" + parseNote
 	}
+	parseNote += imageNote
 	s.recordUsage(ctx, store.UsageEvent{Kind: "parse", Model: method, Chars: parseChars, Status: "ok"})
 
 	// 切块。
-	chunks := chunk.Split(parsed.Markdown, s.chunkOpt)
+	chunks := chunk.Split(markdown, s.chunkOpt)
 	if len(chunks) == 0 {
-		return failParse(fmt.Errorf("切块结果为空"))
+		return s.failParse(ctx, source, prep, fmt.Errorf("切块结果为空"))
 	}
 
 	// 向量化。
@@ -351,23 +439,23 @@ func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string
 	embedFail := func(err error) (Result, error) {
 		st := store.DocStatus{
 			ParseStatus: "ok", ParseMethod: method, ParseNote: parseNote,
-			EmbedStatus: "error", EmbedModel: s.embedModel, EmbedNote: err.Error(), EmbedDim: existing.EmbedDim,
-			RerankStatus: rerankStatus, Chunks: oldChunks,
+			EmbedStatus: "error", EmbedModel: s.embedModel, EmbedNote: err.Error(), EmbedDim: prep.existing.EmbedDim,
+			RerankStatus: prep.rerankStatus, Chunks: prep.oldChunks,
 		}
-		_ = s.store.SetDocumentStatus(ctx, docID, st)
+		_ = s.store.SetDocumentStatus(ctx, prep.docID, st)
 		return Result{
-			DocID: docID, Title: title, Source: source, Chunks: oldChunks,
+			DocID: prep.docID, Title: title, Source: source, Chunks: prep.oldChunks,
 			ParseStatus: "ok", ParseMethod: method, ParseNote: parseNote,
-			EmbedStatus: "error", EmbedModel: s.embedModel, EmbedNote: err.Error(), EmbedDim: existing.EmbedDim,
-			RerankStatus: rerankStatus,
+			EmbedStatus: "error", EmbedModel: s.embedModel, EmbedNote: err.Error(), EmbedDim: prep.existing.EmbedDim,
+			RerankStatus: prep.rerankStatus,
 		}, fmt.Errorf("向量化失败: %w", err)
 	}
 
 	// 解析成功、进入向量化阶段，先更新状态。
-	_ = s.store.SetDocumentStatus(ctx, docID, store.DocStatus{
+	_ = s.store.SetDocumentStatus(ctx, prep.docID, store.DocStatus{
 		ParseStatus: "ok", ParseMethod: method, ParseNote: parseNote,
-		EmbedStatus: "running", EmbedModel: s.embedModel, EmbedDim: existing.EmbedDim,
-		RerankStatus: rerankStatus, Chunks: oldChunks,
+		EmbedStatus: "running", EmbedModel: s.embedModel, EmbedDim: prep.existing.EmbedDim,
+		RerankStatus: prep.rerankStatus, Chunks: prep.oldChunks,
 	})
 
 	embedChars := int64(0)
@@ -407,30 +495,95 @@ func (s *Service) ingestBytes(ctx context.Context, source, fileName, mime string
 		return embedFail(fmt.Errorf("向量维度冲突：库中为 %d，当前模型为 %d；请更换数据文件或清空索引后重试", s.store.Dim(), dim))
 	}
 
-	modelChunks := chunk.ToModelChunks(docID, chunks)
-	if err := s.store.ReplaceChunks(ctx, docID, modelChunks, vectors); err != nil {
+	modelChunks := chunk.ToModelChunks(prep.docID, chunks)
+	if err := s.store.ReplaceChunks(ctx, prep.docID, modelChunks, vectors); err != nil {
 		return embedFail(err)
 	}
 	if err := s.store.UpsertDocument(ctx, store.Document{
-		ID: docID, Source: source, Title: title, MIME: parsed.MIME, Hash: rawHash, Chunks: len(modelChunks),
+		ID: prep.docID, Source: source, Title: title, MIME: parsed.MIME, Hash: prep.rawHash, Chunks: len(modelChunks),
 		ParseStatus: "ok", ParseMethod: method, ParseNote: parseNote,
 		EmbedStatus: "ok", EmbedModel: s.embedModel, EmbedNote: "", EmbedDim: dim,
-		RerankStatus: rerankStatus, OriginPath: originPath, OriginType: originType,
-		Markdown: parsed.Markdown,
+		RerankStatus: prep.rerankStatus, OriginPath: prep.originPath, OriginType: prep.originType,
+		Markdown: markdown,
 	}); err != nil {
 		return Result{}, err
 	}
 	// 成功入库后清掉同一原始文件的旧版本（同一路径被修改后重新入库）。
-	if originPath != "" {
-		_ = s.store.DeleteDocumentsByOriginExcept(ctx, originPath, docID)
+	if prep.originPath != "" {
+		_ = s.store.DeleteDocumentsByOriginExcept(ctx, prep.originPath, prep.docID)
 	}
 
 	return Result{
-		DocID: docID, Title: title, Source: source, Chunks: len(modelChunks),
+		DocID: prep.docID, Title: title, Source: source, Chunks: len(modelChunks),
 		ParseStatus: "ok", ParseMethod: method, ParseNote: parseNote,
 		EmbedStatus: "ok", EmbedModel: s.embedModel, EmbedDim: dim,
-		RerankStatus: rerankStatus,
+		RerankStatus: prep.rerankStatus,
 	}, nil
+}
+
+var markdownImageRE = regexp.MustCompile(`!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)`)
+
+// saveImages 把解析器抽出的图片保存到 <data>/.assets/<docID>/，
+// 并把 Markdown 中的 images/xxx 引用改写为 asset://xxx，供 API 预览时替换为可访问 URL。
+func (s *Service) saveImages(docID, markdown string, images []parse.Image) (string, error) {
+	if len(images) == 0 || strings.TrimSpace(s.uploadDir) == "" {
+		return markdown, nil
+	}
+	dir := filepath.Join(filepath.Dir(s.uploadDir), ".assets", docID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return markdown, err
+	}
+	names := make(map[string]string, len(images)*2)
+	for _, img := range images {
+		name := safeAssetName(img.Name)
+		if name == "" {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), img.Data, 0o644); err != nil {
+			return markdown, err
+		}
+		names[img.Name] = name
+		names[path.Base(img.Name)] = name
+	}
+	rewritten := markdownImageRE.ReplaceAllStringFunc(markdown, func(m string) string {
+		sub := markdownImageRE.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		ref := strings.TrimSpace(sub[2])
+		if strings.HasPrefix(ref, "asset://") {
+			return m
+		}
+		clean := ref
+		if i := strings.IndexAny(clean, "?#"); i >= 0 {
+			clean = clean[:i]
+		}
+		name, ok := names[path.Base(clean)]
+		if !ok {
+			return m
+		}
+		return "![" + sub[1] + "](asset://" + name + ")"
+	})
+	return rewritten, nil
+}
+
+func safeAssetName(name string) string {
+	name = path.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == ".." {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 0x20:
+			continue
+		case strings.ContainsRune(`<>:"/\|?*`, r):
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), " .")
 }
 
 func (s *Service) recordUsage(ctx context.Context, ev store.UsageEvent) {

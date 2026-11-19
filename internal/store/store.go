@@ -44,6 +44,16 @@ type DocStatus struct {
 	Chunks       int
 }
 
+// DocStats 是知识库文档状态的聚合结果，避免为了列表统计加载全部文档。
+type DocStats struct {
+	Total     int
+	Parsed    int
+	Embedded  int
+	Pending   int
+	Failed    int
+	CreatedAt time.Time
+}
+
 // Hit 是向量召回的一条原始结果（未重排）。
 type Hit struct {
 	ChunkID  int64
@@ -124,6 +134,22 @@ type Store interface {
 	// GetChunks 按 chunkID 批量取回文本，用于重排。
 	GetChunks(ctx context.Context, ids []int64) (map[int64]model.Chunk, error)
 
+	// ---- Zotero 文献条目 ----
+	// UpsertLibraryItem 写入或更新一条文献条目（按 item_key 去重）。
+	UpsertLibraryItem(ctx context.Context, item model.LibraryItem) error
+	// GetLibraryItem 按 Zotero item key 取文献条目。
+	GetLibraryItem(ctx context.Context, itemKey string) (model.LibraryItem, bool, error)
+	// GetLibraryItemByDocID 按文档 ID 取文献条目。
+	GetLibraryItemByDocID(ctx context.Context, docID string) (model.LibraryItem, bool, error)
+	// ListLibraryItems 列出全部文献条目。
+	ListLibraryItems(ctx context.Context) ([]model.LibraryItem, error)
+	// GetLibraryItemsByDocIDs 批量按文档 ID 取文献条目，返回 docID -> item。
+	GetLibraryItemsByDocIDs(ctx context.Context, docIDs []string) (map[string]model.LibraryItem, error)
+	// SetLibraryItemStatus 更新同步状态与说明。
+	SetLibraryItemStatus(ctx context.Context, itemKey, status, note string) error
+	// DeleteLibraryItem 删除一条文献条目映射（不删除文档）。
+	DeleteLibraryItem(ctx context.Context, itemKey string) error
+
 	// ListDocuments 列出全部文档。
 	ListDocuments(ctx context.Context) ([]model.Document, error)
 	// GetDocument 按 ID 取文档。
@@ -134,6 +160,8 @@ type Store interface {
 	ListChunks(ctx context.Context, docID string) ([]model.Chunk, error)
 	// CountChunks 统计某文档（docID 为空则全库）的切块数。
 	CountChunks(ctx context.Context, docID string) (int, error)
+	// Stats 用 SQL 聚合文档总数与各处理状态数量，避免加载全部文档。
+	Stats(ctx context.Context) (DocStats, error)
 
 	// AddUsage 追加一条用量记录。
 	AddUsage(ctx context.Context, ev UsageEvent) error

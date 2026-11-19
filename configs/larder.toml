@@ -86,17 +86,45 @@ qps = 8.0
 # ---- 引用格式 ----
 # 设置页「引用格式」修改后会自动写回；未列出的平台会自动补默认值。
 # mode: markdown（悬浮链接）/ plain（纯文本）
-# fields: cite/log/doc/file/heading/text；cite 始终第一位，log 勾选后固定第二位。
+# 每个平台/agent 可单独设置 style；fields 仅用于悬浮内容，纯文本模式不使用。
+# fields: link/reference/file/text（链接、文献词条、文献文件名、原文）；
+# 悬浮模式链接固定第一项，其余顺序即悬停显示顺序。
 [citation]
-version = 2
+version = 5
+# 默认参考文献格式（未单独设置 style 的平台继承它）：gb-t-7714-numeric / gb-t-7714-author-date / apa / ieee / vancouver / mla
+style = 'gb-t-7714-numeric'
 
 [citation.profiles.default]
 mode = 'markdown'
-fields = ['cite', 'log', 'doc', 'file', 'text']
+style = 'gb-t-7714-numeric'
+fields = ['link', 'reference', 'file', 'text']
 
 [citation.profiles.zcode]
 mode = 'plain'
-fields = ['cite', 'log', 'doc', 'file', 'heading', 'text']
+style = 'gb-t-7714-numeric'
+fields = []
+
+# ---- Zotero 文献库（可选） ----
+# 开启后可在界面「文献库」页把 Zotero 集合创建成知识库。
+# 读取顺序：Zotero 本地 API（推荐）→ zotero.sqlite 只读快照。
+# 本地 API 需在 Zotero 设置 → 高级中勾选“允许其他应用与 Zotero 通信”。
+[zotero]
+enabled = false
+# 留空时自动读取 Zotero 的 prefs.js；读取不到再由用户在界面填写。
+data_dir = ''
+api_base = 'http://127.0.0.1:23119/api'
+library_id = '0'
+# storage：解析后的 MD 写到 PDF 同目录；larder：写到 <Zotero 数据目录>/larder-md/<集合>/；off：不落盘
+md_mode = 'storage'
+# auto：优先 PDF 版面解析（MinerU/Docling），失败回退 Zotero 全文；
+# layout：只用 PDF 版面解析；zotero：只用 Zotero 全文缓存（快，无图片）
+parse_mode = 'auto'
+# 文内引用标记与参考文献格式由样式决定
+# gb-t-7714-numeric / gb-t-7714-author-date / apa / ieee / vancouver / mla
+cite_style = 'gb-t-7714-numeric'
+# 监听 zotero.sqlite / storage 变化并自动同步
+watch = true
+watch_interval = '5s'
 
 [log]
 level = 'info'

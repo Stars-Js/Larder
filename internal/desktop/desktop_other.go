@@ -7,3 +7,6 @@ package desktop
 func Run(title, url string, width, height int) error {
 	return ErrNoWebView
 }
+
+// SetTheme 在非 Windows 平台上没有原生窗口可着色。
+func SetTheme(bool) {}

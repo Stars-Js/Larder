@@ -87,6 +87,25 @@
 
 ---
 
+### 表 `library_items`（Zotero 文献条目）
+
+| 列 | 含义 |
+| --- | --- |
+| `item_key` | Zotero item key（主键） |
+| `library_id` / `collection_key` | Zotero 库与集合 |
+| `title` / `year` / `date` | 题名与年份 |
+| `doi` / `url` / `authors` / `journal` / `volume` / `issue` / `pages` / `publisher` / `language` | 引用元数据 |
+| `cite_key` / `bibtex` | 稳定的 citation key 与 BibTeX |
+| `attachment_key` / `attachment_path` | 主附件与本地路径 |
+| `fulltext_source` | `zotero`（全文缓存）/ `parsed`（PDF 解析）/ `metadata` |
+| `item_version` / `date_modified` | 增量同步依据 |
+| `doc_id` | → `documents.id` |
+| `sync_status` / `sync_note` | pending/running/ok/error 与说明 |
+
+Zotero 读取顺序：本地 API（`/api/users/0/...`，支持 collections/items/children/fulltext/file）→
+`zotero.sqlite` 只读快照（复制 db + wal + shm 到临时目录，避免数据库锁）。
+PDF 不复制：`documents.origin_path` 指向 Zotero storage 或 linked file；只保存解析后的 Markdown、chunks 与向量。
+
 ## 3. 入库流水线（`internal/ingest`）
 
 ```
@@ -155,16 +174,45 @@ query
 
 ---
 
+## 4.1 Zotero 同步流水线（`internal/library`）
+
+```
+选择集合 → 读取 item keys + dateModified
+   → 与 library_items 对比（新增/修改/跳过）
+   → 每个 item：
+       元数据（标题/作者/年/DOI/期刊）
+       主附件（PDF 优先）
+       全文：Zotero /fulltext 或 .zotero-ft-cache；否则解析 PDF
+       ingest：切块 → 嵌入 → 落库
+       可选：写 <标题>.md 到 Zotero storage / larder-md
+       写入 library_items
+   → 更新 zotero_last_sync / 成功失败计数
+```
+
+- 同步在后台 goroutine 执行，`GET /api/kbs/{id}/zotero/status` 返回实时进度。
+- 已成功的条目按 `dateModified` 跳过；失败条目保留 `sync_status=error`，下次重试。
+- 引用元数据与 BibTeX 随 item 一起缓存，检索和离线导出不依赖 Zotero 在线。
+- `parse_mode=auto/layout` 时优先用 MinerU/Docling 解析 PDF，保留标题层级、表格与图片；
+  `zotero` 模式只用全文缓存（纯文本，速度快）。
+- MinerU 结果中的 `images/` 保存到 `data/.assets/<docID>/`，Markdown 里改写为 `asset://name`，
+  API 返回内容时替换为可访问的 `/api/.../assets/...` 地址。
+- `Watch` 每 5 秒检查 `zotero.sqlite`、`-wal`、`storage` 的 mtime/size；变化后自动触发对应文献库增量同步。
+
 ## 5. MCP 与 REST
 
 ### MCP（`internal/mcp`）
 
-- 使用官方 `modelcontextprotocol/go-sdk`，以 **Streamable HTTP**、`Stateless` 模式挂载在
+- 使用官方 `modelcontextprotocol/go-sdk`，以 **Streamable HTTP**（有状态 session，30 分钟空闲超时）挂载在
   `server.mcp_path`（默认 `/mcp`）。
 - 工具通过泛型 `mcp.AddTool[In, Out]` 注册，`In/Out` 用 `jsonschema` tag 自动生成 schema。
 - 每个工具既返回人类可读文本（`Content`），也返回结构化 `Out`，便于客户端程序化使用。
-- 工具集：`larder_list_kbs` / `larder_search` / `larder_ingest_file` / `larder_ingest_url` /
-  `larder_list_documents` / `larder_get_document` / `larder_delete_document`。
+- 工具集：`larder_list_libraries` / `larder_select_library` / `larder_search` / `larder_sync_library` /
+  `larder_library_status` / `larder_get_references` / `larder_export_bibliography` /
+  `larder_ingest_file` / `larder_ingest_url` / `larder_list_documents` / `larder_get_document` /
+  `larder_delete_document`，并保留 `larder_list_kbs` / `larder_use_kb` 兼容名。
+- 首次检索在多库且未选择时返回 `selection_required=true`；选择值按 MCP session 保存，无 session 时退化为进程级。
+- 支持 MCP elicitation 的客户端会弹出 `library` 枚举表单：新协议客户端走 `InputRequests`/MRTR，旧协议客户端（如 Cherry Studio）走 `elicitation/create`；用户点击后自动继续检索。没有 elicitation 能力的客户端回退为文本列表。
+- 检索结果为每篇论文生成 `ref_no` / `cite_mark` / `cite_link` / `reference`，并按平台引用配置生成悬浮链接或纯文本行内串；文末统一附 `reference_block`。
 
 ### REST（`internal/api`）
 
