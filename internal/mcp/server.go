@@ -84,9 +84,9 @@ func mcpInstructions() string {
 		"入库/删除等写操作必须指定知识库。" +
 		"每次检索回答的第一行必须原样复制检索结果里的 Markdown 右对齐小标（表格形式），" +
 		"不要改成 HTML、图片或代码块。" +
-		"引用格式以检索结果给出的为准：论文级引用原样使用 results[].cite_link（悬浮模式是可点击链接，纯文本模式是 [1]（著者-年份样式为 (作者, 年)））；" +
-		"只需要纯标记时用 results[].ref_mark，文末参考文献直接复制 reference_block；" +
-		"需要更多格式时调用 larder_get_references。引用紧跟在对应结论句末，严禁编造参考文献。"
+		"引用格式以检索结果给出的为准：论文级引用原样使用 results[].cite_link（悬浮模式是完整 Markdown 链接，链接文字内含上标；纯文本模式是 [1]，著者-年份样式为 (作者, 年)）；" +
+		"悬浮模式必须复制 results[].cite_link 完整链接，每个正文引用都要包含 `](http`；只写 `<sup>[n]</sup>` 或 `[n]` 都不合格，不要加“见”、不要再套一层 `<sup>`；纯文本模式使用标准文内标记。文末参考文献直接复制 reference_block；" +
+		"严禁输出 {{cite:n}}、[cite:id] 或任何占位符；如果无法原样复制链接，只输出 [n]，不要编造。需要更多格式时调用 larder_get_references，引用紧跟在对应结论句末，严禁编造参考文献。"
 }
 
 // Handler 返回可直接挂到 HTTP 路由的处理器。
@@ -226,10 +226,10 @@ type searchInput struct {
 type citation struct {
 	KBName    string  `json:"kb_name,omitempty" jsonschema:"命中所属知识库"`
 	DocID     string  `json:"doc_id,omitempty" jsonschema:"文档 ID"`
-	CiteID    string  `json:"cite_id" jsonschema:"行内引用标记 [cite:id]；ZCode 下为含日志/来源的完整引用串"`
-	CiteLink  string  `json:"cite_link" jsonschema:"完整行内引用串；回答中必须原样使用"`
+	CiteID    string  `json:"cite_id,omitempty" jsonschema:"文档级引用 ID（旧版客户端兼容；正文请优先使用 cite_link）"`
+	CiteLink  string  `json:"cite_link,omitempty" jsonschema:"完整行内引用串；兼容字段"`
 	RefNo     int     `json:"ref_no,omitempty" jsonschema:"论文级参考文献编号"`
-	RefMark   string  `json:"ref_mark,omitempty" jsonschema:"论文级正文引用标记，如 [1]"`
+	RefMark   string  `json:"ref_mark,omitempty" jsonschema:"兼容字段；正文请优先使用 cite_link"`
 	Reference string  `json:"reference,omitempty" jsonschema:"对应的参考文献条目"`
 	Title     string  `json:"title" jsonschema:"文档标题"`
 	Source    string  `json:"source" jsonschema:"来源路径或 URL"`
@@ -247,6 +247,9 @@ type searchOutput struct {
 	Results           []citation      `json:"results" jsonschema:"检索结果列表"`
 	References        []reference     `json:"references,omitempty" jsonschema:"论文级参考文献（去重后）"`
 	ReferenceBlock    string          `json:"reference_block,omitempty" jsonschema:"可直接复制到回答末尾的参考文献 Markdown"`
+	CitationMode      string          `json:"citation_mode,omitempty" jsonschema:"当前客户端引用模式：markdown/plain"`
+	CitationStyle     string          `json:"citation_style,omitempty" jsonschema:"当前客户端参考文献格式"`
+	CitationFields    []string        `json:"citation_fields,omitempty" jsonschema:"当前客户端的悬浮内容字段顺序"`
 	SelectionRequired bool            `json:"selection_required,omitempty" jsonschema:"true 时必须先让用户选择文献库"`
 	Libraries         []libraryOption `json:"libraries,omitempty" jsonschema:"可选文献库列表"`
 	Message           string          `json:"message,omitempty" jsonschema:"提示信息"`
@@ -480,8 +483,8 @@ type reference struct {
 	Title     string `json:"title" jsonschema:"标题"`
 	Authors   string `json:"authors,omitempty" jsonschema:"作者"`
 	Year      int    `json:"year,omitempty" jsonschema:"年份"`
-	Mark      string `json:"cite_mark" jsonschema:"正文引用标记，如 [1]"`
-	CiteLink  string `json:"cite_link" jsonschema:"行内引用：悬浮模式是可点击链接，纯文本模式是文内标记"`
+	Mark      string `json:"cite_mark,omitempty" jsonschema:"兼容字段；正文请优先使用 cite_link"`
+	CiteLink  string `json:"cite_link,omitempty" jsonschema:"完整行内链接；兼容字段"`
 	Text      string `json:"reference" jsonschema:"格式化后的参考文献条目"`
 	BibTeX    string `json:"bibtex,omitempty" jsonschema:"BibTeX 条目"`
 	ZoteroURL string `json:"zotero_url,omitempty" jsonschema:"zotero:// 深链"`
@@ -489,20 +492,23 @@ type reference struct {
 }
 
 type refsInput struct {
-	KB       string `json:"kb,omitempty" jsonschema:"文献库 ID；留空使用当前选择"`
-	DocIDs   string `json:"doc_ids,omitempty" jsonschema:"逗号分隔的 Larder 文档 ID；留空表示全部文献"`
-	ItemKeys string `json:"item_keys,omitempty" jsonschema:"逗号分隔的 Zotero item key；留空表示全部文献"`
-	Style    string `json:"style,omitempty" jsonschema:"引用样式：gb-t-7714-numeric / gb-t-7714-author-date / apa / ieee / vancouver / mla；文内标记由样式决定"`
+	KB            string `json:"kb,omitempty" jsonschema:"文献库 ID；留空使用当前选择"`
+	DocIDs        string `json:"doc_ids,omitempty" jsonschema:"逗号分隔的 Larder 文档 ID；留空表示全部文献"`
+	ItemKeys      string `json:"item_keys,omitempty" jsonschema:"逗号分隔的 Zotero item key；留空表示全部文献"`
+	Style         string `json:"style,omitempty" jsonschema:"引用样式：gb-t-7714-numeric / gb-t-7714-author-date / apa / ieee / vancouver / mla；文内标记由样式决定"`
+	IncludeBibTeX bool   `json:"include_bibtex,omitempty" jsonschema:"是否同时返回 BibTeX；默认 false，避免长文献列表输出过大；需要 .bib 时用 larder_export_bibliography"`
 }
 
 type refsOutput struct {
-	KBID       string      `json:"kb_id"`
-	KBName     string      `json:"kb_name"`
-	Style      string      `json:"style"`
-	Count      int         `json:"count"`
-	References []reference `json:"references"`
-	Markdown   string      `json:"markdown" jsonschema:"可直接放到回答末尾的参考文献 Markdown"`
-	BibTeX     string      `json:"bibtex" jsonschema:"BibTeX 文本"`
+	KBID           string      `json:"kb_id"`
+	KBName         string      `json:"kb_name"`
+	Style          string      `json:"style"`
+	CitationMode   string      `json:"citation_mode,omitempty" jsonschema:"当前客户端引用模式：markdown/plain"`
+	CitationFields []string    `json:"citation_fields,omitempty" jsonschema:"当前客户端的悬浮内容字段顺序"`
+	Count          int         `json:"count"`
+	References     []reference `json:"references"`
+	Markdown       string      `json:"markdown,omitempty" jsonschema:"可直接放到回答末尾的参考文献 Markdown"`
+	BibTeX         string      `json:"bibtex,omitempty" jsonschema:"BibTeX 文本；仅 include_bibtex=true 时返回"`
 }
 
 type exportInput struct {
@@ -668,8 +674,9 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 			"如果未指定 kb 且存在多个文献库，支持 MCP elicitation 的客户端会自动弹出可点击的文献库选项；" +
 			"不支持时返回 selection_required=true 和 libraries，此时不要检索，先把选项展示给用户，用户选择后调用 larder_select_library，再带 kb 重新检索。" +
 			"结果第一行是 Markdown 右对齐表格小标，请原样放在回答最上方；不要用 HTML、图片或代码块。" +
-			"论文级引用原样使用 results[].cite_link（悬浮模式是可点击链接，纯文本模式是 [1]（著者-年份样式为 (作者, 年)））；" +
-			"只需纯标记时用 results[].ref_mark；文末参考文献直接复制 reference_block；" +
+			"论文级引用原样使用 results[].cite_link（悬浮模式是完整 Markdown 链接，链接文字内含上标；纯文本模式是 [1]，著者-年份样式为 (作者, 年)）；" +
+			"悬浮模式必须复制 results[].cite_link 完整链接（每个引用包含 `](http`；只写 `<sup>[n]</sup>` 不合格）；纯文本模式使用标准文内标记；文末参考文献直接复制 reference_block；" +
+			"严禁输出 {{cite:n}}、[cite:id] 或任何占位符；如果无法原样复制链接，只输出 [n]。" +
 			"需要其他样式时调用 larder_get_references；严禁编造未出现在 references 中的文献。",
 	}, func(ctx context.Context, req *sdkmcp.CallToolRequest, in searchInput) (*sdkmcp.CallToolResult, searchOutput, error) {
 		session := state.sessionKey(req)
@@ -768,26 +775,32 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 		// 论文级参考文献：同一篇论文的多个 chunk 共用一个编号。
 		// 参考文献格式按当前客户端/agent 的独立配置。
 		cfg := state.mgr.Config()
-		citeStyle := firstOf(style.ReferenceStyle, cfg.Citation.ReferenceStyle, cfg.Zotero.CiteStyle)
+		citeStyle := firstOf(style.ReferenceStyle, cfg.Zotero.CiteStyle)
 		// 引用显示方式（悬浮/纯文本、悬停字段与排序）统一使用「设置 → 引用格式」。
 		refs, refMap, _ := state.referencesForHits(ctx, tgt.id, hits, citeStyle, style, logID)
 
+		refBlock := formatReferenceBlock(refs, citeStyle)
 		out := searchOutput{
 			KBID: tgt.id, KBName: tgt.name, Badge: "Larder · " + tgt.name,
 			BadgeMarkdown: badge,
 			Count:         len(hits), Results: toCitations(hits, state.baseURL, logID, style, profile == "zcode", textLimit),
-			References: refs, ReferenceBlock: formatReferenceBlock(refs, citeStyle),
+			References: refs, ReferenceBlock: refBlock,
+			CitationMode: style.Mode, CitationStyle: citeStyle, CitationFields: style.Fields,
 		}
 		for i := range out.Results {
 			if r, ok := refMap[out.Results[i].DocID]; ok {
 				out.Results[i].RefNo = r.RefNo
-				out.Results[i].RefMark = r.Mark
 				out.Results[i].Reference = r.Text
 				// 论文级引用：悬浮模式是可点击链接，纯文本模式是文内标记。
-				out.Results[i].CiteID = r.CiteLink
 				out.Results[i].CiteLink = r.CiteLink
+				if style.Mode == "plain" {
+					out.Results[i].CiteID = r.CiteLink
+					out.Results[i].RefMark = r.CiteLink
+				}
 			}
 		}
+		// 悬浮模式下不再把同一长链接塞进 cite_id/ref_mark 三个字段；
+		// 只保留 cite_link，显著缩短工具结果，避免客户端把结果持久化/截断。
 		text := formatPaperCitations(hits, refMap, tgt.name, badge)
 		if len(refs) > 0 {
 			text += "\n\n" + out.ReferenceBlock
@@ -796,12 +809,31 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 				if cite.IsNumeric(citeStyle) {
 					markExample = "「[1]」"
 				}
-				text += fmt.Sprintf("\n\n【引用要求】正文原样使用 results[].cite_link 作为文内引用标记（如 %s）；"+
-					"纯文本模式不要把链接、文献词条、文件名或原文塞进行内，完整参考文献统一放在文末；"+
-					"文末必须附上面的完整参考文献块，或调用 larder_export_bibliography 生成 .bib 文件；严禁编造未出现在 references 中的文献。", markExample)
+				text += fmt.Sprintf("\n\n【引用要求｜当前设置】模式=纯文本；格式=%s。正文原样使用 results[].cite_link 作为文内引用标记（如 %s）；禁止使用 [23] 等自行编号；"+
+					"不要把链接、文献词条、文件名或原文塞进行内，完整参考文献统一放在文末；"+
+					"文末必须附上面的完整参考文献块，或调用 larder_export_bibliography 生成 .bib 文件；严禁编造未出现在 references 中的文献。", citeStyle, markExample)
 			} else {
-				text += "\n\n【引用要求】正文使用 references[].cite_link 作为悬浮链接，链接文字是文内引用标记（如 [1] 或 (作者, 年)）；" +
-					"悬停内容按「设置 → 引用格式」里勾选并排序的字段生成；文末必须附上面的完整参考文献块。严禁编造未出现在 references 中的文献。"
+				text += fmt.Sprintf("\n\n【引用要求｜当前设置】模式=悬浮链接；格式=%s；悬停字段=%s。正文必须原样使用上方「正文引用」表中的完整链接；每个引用必须包含 `](http`，只写 `<sup>[1]</sup>` 或 `[1]` 都不合格；不要加“见”、也不要再套一层 `<sup>`；"+
+					"严禁输出 {{cite:n}}、[cite:id] 或任何占位符；无法复制链接时只写 [n]。文末必须附上面的完整参考文献块。严禁编造未出现在 references 中的文献。", citeStyle, strings.Join(style.Fields, "、"))
+			}
+		}
+		// 结构化输出同样瘦身：悬浮模式只保留 cite_link；搜索结果正文保留完整内容在 content 中，
+		// 这里截到便于模型定位的长度，避免整个结果超过客户端的大小限制。
+		for i := range out.Results {
+			out.Results[i].Text = truncateRunes(out.Results[i].Text, 700)
+			if style.Mode != "plain" {
+				out.Results[i].CiteID = ""
+				out.Results[i].RefMark = ""
+			}
+		}
+		for i := range refs {
+			refs[i].BibTeX = ""
+			refs[i].ZoteroURL = ""
+			refs[i].PDFURL = ""
+			refs[i].Authors = ""
+			refs[i].Year = 0
+			if style.Mode != "plain" {
+				refs[i].Mark = ""
 			}
 		}
 		return textResult(text), out, nil
@@ -810,8 +842,9 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 	sdkmcp.AddTool(s, &sdkmcp.Tool{
 		Name: "larder_get_references",
 		Description: "把指定文献格式化为参考文献。首次问答后、或用户要求换引用样式时使用。" +
-			"传入 doc_ids / item_keys；留空则返回该文献库全部文献。返回 Markdown 参考文献块和 BibTeX；" +
-			"正文引用使用 references[].cite_mark，文末直接复制 markdown 字段。",
+			"传入 doc_ids / item_keys；留空则返回该文献库全部文献。默认返回 Markdown 参考文献块与正文 cite_link；" +
+			"需要 BibTeX 时显式传 include_bibtex=true，或调用 larder_export_bibliography 导出 .bib。" +
+			"悬浮模式下正文引用使用 references[].cite_link（完整 Markdown 链接，链接文字内含上标），纯文本模式下等价于文内标记；文末直接复制 markdown 字段。",
 	}, func(ctx context.Context, req *sdkmcp.CallToolRequest, in refsInput) (*sdkmcp.CallToolResult, refsOutput, error) {
 		session := state.sessionKey(req)
 		kbID, a, kbName, err := state.resolveKB(ctx, in.KB, session)
@@ -820,19 +853,79 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 		}
 		cfg := state.mgr.Config()
 		display := cfg.Citation.Style(state.citationProfile(req))
-		style := cite.NormalizeStyle(firstOf(in.Style, display.ReferenceStyle, cfg.Citation.ReferenceStyle, cfg.Zotero.CiteStyle))
+		style := cite.NormalizeStyle(firstOf(in.Style, display.ReferenceStyle, cfg.Zotero.CiteStyle))
 		items, err := state.itemsForRefs(ctx, a, in.DocIDs, in.ItemKeys)
 		if err != nil {
 			return errResult(err), refsOutput{}, nil
 		}
 		refs := buildRefs(items, style)
-		out := refsOutput{
-			KBID: kbID, KBName: kbName, Style: style, Count: len(refs),
-			References: refs, Markdown: formatReferenceBlock(refs, style), BibTeX: bibtexBlock(refs),
+		large := len(refs) > 20
+		if display.Mode != "plain" {
+			var excerpt func(string) string
+			if hasField(display.Fields, "text") {
+				cache := map[string]string{}
+				excerpt = func(docID string) string {
+					if v, ok := cache[docID]; ok {
+						return v
+					}
+					chunks, err := a.Store.ListChunks(ctx, docID)
+					if err != nil || len(chunks) == 0 {
+						cache[docID] = ""
+						return ""
+					}
+					text := strings.TrimSpace(chunks[0].Text)
+					if r := []rune(text); len(r) > 60 {
+						text = string(r[:60]) + "…"
+					}
+					cache[docID] = text
+					return text
+				}
+			}
+			// 大列表只保留“链接 + 文献词条”，避免悬浮标题把输出撑到客户端大小限制以上。
+			linkDisplay := display
+			if large {
+				linkDisplay.Fields = []string{"link", "reference"}
+			}
+			enrichReferenceLinks(refs, items, style, linkDisplay, kbID, appBase(state.baseURL), excerpt)
 		}
-		text := out.Markdown
-		if out.BibTeX != "" {
-			text += "\n\n```bibtex\n" + strings.TrimSpace(out.BibTeX) + "\n```"
+		markdown := formatReferenceBlock(refs, style)
+		bib := ""
+		if in.IncludeBibTeX {
+			bib = bibtexBlock(refs)
+		}
+		out := refsOutput{
+			KBID: kbID, KBName: kbName, Style: style, CitationMode: display.Mode,
+			CitationFields: display.Fields, Count: len(refs),
+			References: refs, Markdown: markdown, BibTeX: bib,
+		}
+		text := ""
+		text += citationLinkList(refs, large) + "\n\n"
+		text += out.Markdown
+		if bib != "" {
+			text += "\n\n```bibtex\n" + strings.TrimSpace(bib) + "\n```"
+		}
+		if display.Mode != "plain" && hasField(display.Fields, "link") {
+			text += fmt.Sprintf("\n\n【引用提示｜当前设置】模式=悬浮链接；格式=%s；悬停字段=%s。正文引用请原样使用上方「正文引用」表中的完整链接；每个引用必须包含 `](http`，只写 `<sup>[1]</sup>` 或 `[1]` 都不合格；不要加“见”、也不要再套一层 `<sup>`；严禁输出 {{cite:n}}、[cite:id] 或任何占位符；无法复制链接时只写 [n]。文末直接复制上面的参考文献块。", style, strings.Join(display.Fields, "、"))
+		} else if display.Mode == "plain" {
+			text += fmt.Sprintf("\n\n【引用提示｜当前设置】模式=纯文本；格式=%s。正文原样使用上方「正文引用」表中的文内标记；禁止使用 [23] 等自行编号。文末复制上面的参考文献块。", style)
+		}
+		// 压缩结构化输出：悬浮模式只保留 cite_link；大列表不再重复逐条 reference 文本
+		// 和 markdown（content 中已完整给出），避免超过客户端结果大小限制。
+		for i := range refs {
+			refs[i].BibTeX = ""
+			refs[i].ZoteroURL = ""
+			refs[i].PDFURL = ""
+			refs[i].Authors = ""
+			refs[i].Year = 0
+			if display.Mode != "plain" {
+				refs[i].Mark = ""
+			}
+			if large {
+				refs[i].Text = ""
+			}
+		}
+		if large {
+			out.Markdown = ""
 		}
 		return textResult(text), out, nil
 	})
@@ -849,7 +942,7 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 		}
 		cfg := state.mgr.Config()
 		display := cfg.Citation.Style(state.citationProfile(req))
-		style := cite.NormalizeStyle(firstOf(in.Style, display.ReferenceStyle, cfg.Citation.ReferenceStyle, cfg.Zotero.CiteStyle))
+		style := cite.NormalizeStyle(firstOf(in.Style, display.ReferenceStyle, cfg.Zotero.CiteStyle))
 		items, err := state.itemsForRefs(ctx, a, in.DocIDs, in.ItemKeys)
 		if err != nil {
 			return errResult(err), exportOutput{}, nil
@@ -922,7 +1015,7 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 			return errResult(err), ingestOutput{}, nil
 		}
 		start := time.Now()
-		res, err := a.Ingest.IngestFile(ctx, in.Path, ingest.Options{Title: in.Title, Refresh: in.Refresh})
+		res, err := a.Ingest.IngestFile(ctx, in.Path, ingest.Options{Title: in.Title, Refresh: in.Refresh, CopySource: true})
 		if err != nil {
 			state.record("MCP 入库", kbName, firstOf(in.Title, in.Path), "error", err.Error(), start)
 			return errResult(err), ingestOutput{}, nil
@@ -941,7 +1034,7 @@ func registerTools(s *sdkmcp.Server, mgr *kb.Manager, state *Server) {
 			return errResult(err), ingestOutput{}, nil
 		}
 		start := time.Now()
-		res, err := a.Ingest.IngestURL(ctx, in.URL, ingest.Options{Title: in.Title, Refresh: in.Refresh})
+		res, err := a.Ingest.IngestURL(ctx, in.URL, ingest.Options{Title: in.Title, Refresh: in.Refresh, CopySource: true})
 		if err != nil {
 			state.record("MCP 入库", kbName, firstOf(in.Title, in.URL), "error", err.Error(), start)
 			return errResult(err), ingestOutput{}, nil
@@ -1350,6 +1443,18 @@ func citationText(id, source, link string, showCite, showLog, doubleBracket bool
 	return prefix + "（" + strings.Join(body, "；") + "）"
 }
 
+// hoverCitationLink 生成带 <sup> 上标的 Markdown 链接。
+// <sup> 放在链接文字内部，而不是包在链接外面：Cherry Studio 的
+// shouldShowMarkdownLinkFavicon 对包含元素子节点的链接不显示 favicon，
+// 这样既能保留点击/悬停，又不会出现链接图标。
+func hoverCitationLink(mark, linkURL, title string, sup bool) string {
+	text := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(mark)
+	if sup {
+		text = "<sup>" + text + "</sup>"
+	}
+	return fmt.Sprintf("[%s](%s \"%s\")", text, linkURL, markdownTitle(title))
+}
+
 func markdownTitle(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -1378,7 +1483,7 @@ func formatCitations(hits []model.SearchHit, kbName, badge, publicURL, logID str
 }
 
 // formatCitationsMode 在文献库模式下不再要求复制 chunk 级 cite:id，
-// 而是让模型使用论文级 ref_mark 和参考文献块。
+// 而是让模型使用论文级 cite_link 和参考文献块。
 func formatCitationsMode(hits []model.SearchHit, kbName, badge, publicURL, logID string, style config.CitationStyle, textLimit int, referenceMode bool) string {
 	if kbName == "" {
 		kbName = "Larder"
@@ -1442,9 +1547,45 @@ func formatPaperCitations(hits []model.SearchHit, refMap map[string]reference, k
 		return prefix + "\n\n未检索到相关内容。"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n找到 %d 条相关片段：\n", prefix, len(hits))
+	fmt.Fprintf(&b, "%s\n", prefix)
+
+	// 先把本批唯一论文的完整引用链接放在最上方。客户端截断/持久化长结果时，
+	// 模型仍能在第一页拿到可直接复制的 cite_link，不必从大段 JSON 里翻找。
+	seenDoc := map[string]bool{}
+	uniq := make([]reference, 0, len(hits))
+	for _, h := range hits {
+		if h.DocID == "" || seenDoc[h.DocID] {
+			continue
+		}
+		seenDoc[h.DocID] = true
+		if r, ok := refMap[h.DocID]; ok && r.CiteLink != "" {
+			uniq = append(uniq, r)
+		}
+	}
+	if len(uniq) > 0 {
+		hover := strings.Contains(uniq[0].CiteLink, "](")
+		if hover {
+			b.WriteString("\n【正文引用｜必须连链接一起原样复制】\n")
+			b.WriteString("正确：[<sup>[1]</sup>](http://… \"…\")　错误：[1] 或 <sup>[1]</sup>（没有链接，不合格）\n")
+		} else {
+			b.WriteString("\n【正文引用｜原样复制文内标记；不要自行编号】\n")
+		}
+		for _, r := range uniq {
+			if hover {
+				fmt.Fprintf(&b, "[%d] %s\n%s\n", r.RefNo, oneLine(r.Title), r.CiteLink)
+			} else {
+				fmt.Fprintf(&b, "%s  ← %s\n", r.CiteLink, oneLine(r.Title))
+			}
+		}
+	}
+
+	fmt.Fprintf(&b, "\n找到 %d 条相关片段：\n", len(hits))
 	for i, h := range hits {
-		fmt.Fprintf(&b, "\n[%d] ", i+1)
+		label := i + 1
+		if r, ok := refMap[h.DocID]; ok && r.RefNo > 0 {
+			label = r.RefNo
+		}
+		fmt.Fprintf(&b, "\n[%d] ", label)
 		if h.KBName != "" {
 			fmt.Fprintf(&b, "知识库：%s · ", h.KBName)
 		}
@@ -1455,12 +1596,17 @@ func formatPaperCitations(hits []model.SearchHit, refMap map[string]reference, k
 		if h.Heading != "" {
 			fmt.Fprintf(&b, "章节：%s\n", h.Heading)
 		}
-		if r, ok := refMap[h.DocID]; ok && r.CiteLink != "" {
-			fmt.Fprintf(&b, "引用：%s\n", r.CiteLink)
-		}
 		fmt.Fprintf(&b, "\n%s\n", h.Text)
 	}
 	return b.String()
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // itemsForRefs 按 doc_ids / item_keys 取文献条目；都为空时返回全部。
@@ -1554,6 +1700,44 @@ func buildRefs(items []model.LibraryItem, style string) []reference {
 	return out
 }
 
+// enrichReferenceLinks 给 larder_get_references 的论文级条目补上悬浮链接。
+// 没有命中 chunk 时用文档首个切块作为「原文」示例，保证悬浮内容不为空。
+func enrichReferenceLinks(refs []reference, items []model.LibraryItem, style string, display config.CitationStyle, kbID, base string, excerpt func(string) string) {
+	if display.Mode == "plain" || !hasField(display.Fields, "link") {
+		return
+	}
+	byDoc := make(map[string]model.LibraryItem, len(items)*2)
+	for _, it := range items {
+		if it.DocID != "" {
+			byDoc[it.DocID] = it
+		}
+		if it.ItemKey != "" {
+			byDoc[it.ItemKey] = it
+		}
+	}
+	for i := range refs {
+		it, ok := byDoc[refs[i].DocID]
+		if !ok {
+			it, ok = byDoc[refs[i].ItemKey]
+		}
+		if !ok || refs[i].DocID == "" {
+			continue
+		}
+		mark := refs[i].Mark
+		line := refs[i].Text
+		if cite.IsNumeric(style) {
+			line = mark + " " + line
+		}
+		h := model.SearchHit{DocID: refs[i].DocID, DocTitle: it.Title, Source: it.AttachmentPath}
+		if excerpt != nil {
+			h.Text = excerpt(refs[i].DocID)
+		}
+		title := paperHoverTitle(it, h, line, display.Fields, "")
+		linkURL := fmt.Sprintf("%s/r/%s/%s", base, url.PathEscape(kbID), url.PathEscape(refs[i].DocID))
+		refs[i].CiteLink = hoverCitationLink(mark, linkURL, title, cite.IsNumeric(style))
+	}
+}
+
 // referencesForHits 按命中顺序去重到论文级，并生成可点击的 hover 引用。
 func (s *Server) referencesForHits(ctx context.Context, kbID string, hits []model.SearchHit, style string, display config.CitationStyle, logID string) ([]reference, map[string]reference, error) {
 	style = cite.NormalizeStyle(style)
@@ -1606,7 +1790,7 @@ func (s *Server) referencesForHits(ctx context.Context, kbID string, hits []mode
 			if hasField(display.Fields, "link") {
 				linkURL := fmt.Sprintf("%s/r/%s/%s", base, url.PathEscape(kb), url.PathEscape(h.DocID))
 				title := paperHoverTitle(item, h, line, display.Fields, logLink(base, logID))
-				ref.CiteLink = fmt.Sprintf("[%s](%s \"%s\")", markStr, linkURL, markdownTitle(title))
+				ref.CiteLink = hoverCitationLink(markStr, linkURL, title, cite.IsNumeric(style))
 			} else {
 				ref.CiteLink = markStr
 			}
@@ -1637,8 +1821,8 @@ func paperFileName(item model.LibraryItem, h model.SearchHit) string {
 
 func paperExcerpt(h model.SearchHit) string {
 	excerpt := oneLine(activity.CleanText(h.Text))
-	if r := []rune(excerpt); len(r) > 160 {
-		excerpt = string(r[:160]) + "…"
+	if r := []rune(excerpt); len(r) > 50 {
+		excerpt = string(r[:50]) + "…"
 	}
 	return excerpt
 }
@@ -1656,12 +1840,12 @@ func paperHoverTitle(item model.LibraryItem, h model.SearchHit, refText string, 
 		case "reference":
 			if refText != "" {
 				b.WriteString("【文献词条】")
-				b.WriteString(refText)
+				b.WriteString(truncateRunes(refText, 100))
 			}
 		case "file":
 			if fileName != "" && fileName != "." {
 				b.WriteString("【文献文件名】")
-				b.WriteString(fileName)
+				b.WriteString(truncateRunes(fileName, 40))
 			}
 		case "doc":
 			if item.Title != "" {
@@ -1689,6 +1873,40 @@ func paperHoverTitle(item model.LibraryItem, h model.SearchHit, refText string, 
 		return refText
 	}
 	return b.String()
+}
+
+// citationLinkList 把本次调用的正文引用链接集中放在结果最上方。
+// 客户端截断长结果时，模型仍能直接复制 cite_link，而不是自行编造占位符。
+func citationLinkList(refs []reference, compact bool) string {
+	var b strings.Builder
+	hover := false
+	for _, r := range refs {
+		if strings.Contains(r.CiteLink, "](") {
+			hover = true
+			break
+		}
+	}
+	if hover {
+		b.WriteString("【正文引用｜本次编号，必须连链接一起原样复制】\n")
+		b.WriteString("正确：[<sup>[1]</sup>](http://… \"…\")　错误：[1] 或 <sup>[1]</sup>（没有链接，不合格）\n")
+	} else {
+		b.WriteString("【正文引用｜本次编号，原样复制文内标记；不要自行编号】\n")
+	}
+	for _, r := range refs {
+		if r.CiteLink == "" {
+			continue
+		}
+		if compact {
+			fmt.Fprintf(&b, "[%d] %s\n", r.RefNo, r.CiteLink)
+			continue
+		}
+		if hover {
+			fmt.Fprintf(&b, "[%d] %s\n%s\n", r.RefNo, oneLine(r.Title), r.CiteLink)
+		} else {
+			fmt.Fprintf(&b, "%s  ← %s\n", r.CiteLink, oneLine(r.Title))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func formatReferenceBlock(refs []reference, style string) string {

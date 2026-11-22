@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -216,7 +217,7 @@ func (s *Service) Collections(ctx context.Context, dataDir, apiBase, libraryID s
 	if strings.TrimSpace(libraryID) == "" {
 		libraryID = cfg.Zotero.LibraryID
 	}
-	c := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID})
+	c := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID, APIKey: s.mgr.Config().Zotero.LocalAPIKey})
 	defer c.Close()
 	cols, err := c.Collections(ctx)
 	if err != nil {
@@ -238,7 +239,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (kb.Info, error
 	if collectionKey == "" {
 		return kb.Info{}, fmt.Errorf("请选择 Zotero 集合")
 	}
-	c := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID})
+	c := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID, APIKey: s.mgr.Config().Zotero.LocalAPIKey})
 	defer c.Close()
 	cols, err := c.Collections(ctx)
 	if err != nil {
@@ -388,7 +389,7 @@ func (s *Service) run(ctx context.Context, kbID string, opt SyncOptions, job *Jo
 		return
 	}
 
-	source := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID})
+	source := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID, APIKey: s.mgr.Config().Zotero.LocalAPIKey})
 	defer source.Close()
 
 	// 先取集合名（旧库可能没有缓存）。
@@ -492,6 +493,7 @@ func (s *Service) syncItem(ctx context.Context, a *app.App, source *zotero.Clien
 	oldItem, oldExists, _ := a.Store.GetLibraryItem(ctx, item.Key)
 	if !opt.Force && oldExists && oldItem.DateModified == item.DateModified && oldItem.DocID != "" {
 		if doc, ok, _ := a.Store.GetDocument(ctx, oldItem.DocID); ok && doc.EmbedStatus == "ok" && doc.ParseStatus == "ok" {
+			s.ensureItemMarkdownLink(ctx, source, item, oldItem.DocID, collectionName, dataDir, a.DataDir, mdMode)
 			_ = a.Store.SetLibraryItemStatus(ctx, item.Key, "ok", "内容未变化，已跳过")
 			return true, nil
 		}
@@ -516,6 +518,44 @@ func (s *Service) syncItem(ctx context.Context, a *app.App, source *zotero.Clien
 	var err error
 	fulltextSource := "parsed"
 	ingested := false
+	reusedSidecar := false
+	sidecarPath, sidecarMod, hasSidecar := existingSidecar(dataDir, mdMode, collectionName, att, item)
+
+	// 已有解析 Markdown 且不比 PDF 旧时直接复用它，避免重复调用版面解析。
+	// opt.Force（用户点“重新处理”）仍然强制重新解析。
+	if !opt.Force && hasSidecar {
+		reuse := true
+		if attPath != "" {
+			if fi, statErr := os.Stat(attPath); statErr == nil && fi.ModTime().After(sidecarMod.Add(2*time.Second)) {
+				reuse = false
+			}
+		}
+		if reuse {
+			if raw, rerr := os.ReadFile(sidecarPath); rerr == nil && strings.TrimSpace(string(raw)) != "" {
+				original := string(raw)
+				normalized := normalizeSidecarLayout(sidecarPath, original)
+				if normalized != original {
+					tmp := sidecarPath + ".tmp"
+					if werr := os.WriteFile(tmp, []byte(normalized), 0o644); werr == nil {
+						_ = os.Rename(tmp, sidecarPath)
+					}
+				}
+				md, images := sidecarMarkdownForIngest(normalized)
+				res, err = a.Ingest.IngestMarkdown(ctx, zoteroSource(libraryID, item.Key), filepath.Base(sidecarPath), "text/markdown", md, ingest.Options{
+					Title: item.Title, OriginPath: attPath, OriginType: "file",
+				})
+				if err == nil {
+					ingested = true
+					reusedSidecar = true
+					fulltextSource = "sidecar"
+					copySidecarImages(sidecarPath, a.DataDir, res.DocID, images)
+				} else {
+					s.logger.Warn("复用解析 Markdown 失败，回退重新解析", "item", item.Key, "err", err)
+					err = nil
+				}
+			}
+		}
+	}
 
 	// layout：优先用 MinerU/Docling 解析 PDF，保留标题层级、版式、表格与图片；
 	// auto：配置了外部解析器就用版面解析，失败后回退 Zotero 全文缓存；
@@ -578,9 +618,16 @@ func (s *Service) syncItem(ctx context.Context, a *app.App, source *zotero.Clien
 
 	markdown, _ := a.Store.GetDocumentMarkdown(ctx, res.DocID)
 	if mdMode != "off" && strings.TrimSpace(markdown) != "" {
-		assetsDir := filepath.Join(a.Cfg.Storage.Dir, ".assets", res.DocID)
-		if _, werr := writeMarkdownSidecar(dataDir, mdMode, collectionName, att, item, markdown, assetsDir); werr != nil {
-			s.logger.Warn("写入 Zotero Markdown 失败", "item", item.Key, "err", werr)
+		if !reusedSidecar || sidecarPath == "" {
+			assetsDir := filepath.Join(a.DataDir, "image", res.DocID)
+			if p, werr := writeMarkdownSidecar(dataDir, mdMode, collectionName, att, item, markdown, assetsDir); werr != nil {
+				s.logger.Warn("写入 Zotero Markdown 失败", "item", item.Key, "err", werr)
+			} else {
+				sidecarPath = p
+			}
+		}
+		if sidecarPath != "" {
+			s.ensureItemMarkdownLink(ctx, source, item, res.DocID, collectionName, dataDir, a.DataDir, mdMode)
 		}
 	}
 
@@ -779,12 +826,165 @@ func metadataText(it zotero.Item) string {
 	return strings.TrimSpace(b.String())
 }
 
+// ensureItemMarkdownLink 在 item 模式下把已有 sidecar 挂到 Zotero 词条下。
+// 未授权或旧版 Zotero 只记录警告，不影响同步。
+func (s *Service) ensureItemMarkdownLink(ctx context.Context, source *zotero.Client, item zotero.Item, docID, collectionName, dataDir, kbDataDir, mdMode string) {
+	mode := normalizeMDMode(mdMode)
+	if mode == "off" {
+		return
+	}
+	att, ok := zotero.PrimaryAttachment(item.Attachments)
+	if !ok {
+		return
+	}
+	mdPath, _, ok := existingSidecar(dataDir, mdMode, collectionName, att, item)
+	if !ok {
+		return
+	}
+	// sidecar 已有图片时，不再在知识库目录保留重复副本。
+	if hasSidecarImages(mdPath) && docID != "" {
+		_ = os.RemoveAll(filepath.Join(kbDataDir, "image", docID))
+	}
+	if mode != "item" || strings.TrimSpace(s.mgr.Config().Zotero.LocalAPIKey) == "" {
+		return
+	}
+	if _, created, err := source.EnsureMarkdownLink(ctx, item.Key, "Larder Markdown", mdPath); err != nil {
+		s.logger.Warn("挂载 Zotero Markdown 子附件失败（需要 Zotero 10+ 本地写入授权）", "item", item.Key, "err", err)
+	} else if created {
+		s.logger.Info("已在 Zotero 词条下创建 Markdown 子附件", "item", item.Key, "path", mdPath)
+	}
+}
+
+// ExistingSidecarForItem 返回 Zotero 文献条目已有的解析 Markdown 路径。
+func ExistingSidecarForItem(dataDir, mode, collectionName string, item model.LibraryItem) (string, bool) {
+	att := zotero.Attachment{Key: item.AttachmentKey}
+	if strings.TrimSpace(item.AttachmentPath) != "" {
+		att.Path = "storage:" + filepath.Base(item.AttachmentPath)
+	}
+	zitem := zotero.Item{Key: item.ItemKey, Title: item.Title}
+	p, _, ok := existingSidecar(dataDir, mode, collectionName, att, zitem)
+	return p, ok
+}
+
+// RepairResult 是修复词条附件的统计。
+type RepairResult struct {
+	Total       int      `json:"total"`
+	Linked      int      `json:"linked"`
+	Created     int      `json:"created"`
+	Skipped     int      `json:"skipped"`
+	Failed      int      `json:"failed"`
+	AuthExpired bool     `json:"auth_expired,omitempty"`
+	Message     string   `json:"message,omitempty"`
+	Errors      []string `json:"errors,omitempty"`
+}
+
+// RepairMarkdownLinks 把已有 sidecar Markdown 挂到 Zotero 词条下，并清理
+// 知识库目录里与 Zotero image/ 重复的图片副本。
+func (s *Service) RepairMarkdownLinks(ctx context.Context, kbID string) (RepairResult, error) {
+	a, err := s.mgr.Get(kbID)
+	if err != nil {
+		return RepairResult{}, err
+	}
+	meta := s.meta(a)
+	dataDir := firstNonEmpty(meta[MetaZoteroDataDir], s.mgr.Config().Zotero.DataDir)
+	apiBase := firstNonEmpty(meta[MetaZoteroAPIBase], s.mgr.Config().Zotero.APIBase, "http://127.0.0.1:23119/api")
+	libraryID := firstNonEmpty(meta[MetaZoteroLibraryID], s.mgr.Config().Zotero.LibraryID)
+	collectionName := firstNonEmpty(meta[MetaZoteroCollectionName], meta[MetaZoteroCollection])
+	mdMode := normalizeMDMode(firstNonEmpty(meta[MetaZoteroMDMode], s.mgr.Config().Zotero.MDMode))
+	if mdMode == "off" {
+		return RepairResult{}, fmt.Errorf("当前设置为“不保存”，没有可挂载的解析 Markdown")
+	}
+	key := strings.TrimSpace(s.mgr.Config().Zotero.LocalAPIKey)
+	if key == "" {
+		return RepairResult{}, fmt.Errorf("请先在「文献库」页点击“授权写入 Zotero”")
+	}
+	source := zotero.New(zotero.Config{DataDir: dataDir, APIBase: apiBase, LibraryID: libraryID, APIKey: key})
+	defer source.Close()
+	items, err := a.Store.ListLibraryItems(ctx)
+	if err != nil {
+		return RepairResult{}, err
+	}
+	out := RepairResult{Total: len(items)}
+	validDocs := map[string]bool{}
+	for _, item := range items {
+		if item.DocID != "" {
+			validDocs[item.DocID] = true
+		}
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.ItemKey) == "" {
+			out.Skipped++
+			continue
+		}
+		mdPath, ok := ExistingSidecarForItem(dataDir, mdMode, collectionName, item)
+		if !ok {
+			out.Skipped++
+			continue
+		}
+		if raw, rerr := os.ReadFile(mdPath); rerr == nil {
+			normalized := normalizeSidecarLayout(mdPath, string(raw))
+			if normalized != string(raw) {
+				tmp := mdPath + ".tmp"
+				if werr := os.WriteFile(tmp, []byte(normalized), 0o644); werr == nil {
+					_ = os.Rename(tmp, mdPath)
+				}
+			}
+		}
+		if hasSidecarImages(mdPath) && item.DocID != "" {
+			_ = os.RemoveAll(filepath.Join(a.DataDir, "image", item.DocID))
+		}
+		_, created, aerr := source.EnsureMarkdownLink(ctx, item.ItemKey, "Larder Markdown", mdPath)
+		if aerr != nil {
+			out.Failed++
+			if strings.Contains(aerr.Error(), "401") || strings.Contains(strings.ToLower(aerr.Error()), "expired") {
+				out.AuthExpired = true
+			}
+			if len(out.Errors) < 20 {
+				out.Errors = append(out.Errors, item.Title+"："+aerr.Error())
+			}
+			continue
+		}
+		if created {
+			out.Created++
+		} else {
+			out.Linked++
+		}
+	}
+	// 清理不再对应任何文档的旧 image/<docID>/ 目录（例如重建知识库留下的孤儿目录）。
+	if entries, rerr := os.ReadDir(filepath.Join(a.DataDir, "image")); rerr == nil {
+		for _, e := range entries {
+			if e.IsDir() && !validDocs[e.Name()] {
+				_ = os.RemoveAll(filepath.Join(a.DataDir, "image", e.Name()))
+			}
+		}
+	}
+	_ = os.Remove(filepath.Join(a.DataDir, "image")) // 仅在已空时成功
+	return out, nil
+}
+
+// hasSidecarImages 判断 sidecar 同目录是否存在 image/ 或旧版 images/。
+func hasSidecarImages(mdPath string) bool {
+	for _, sub := range []string{"image", "images"} {
+		if entries, err := os.ReadDir(filepath.Join(filepath.Dir(mdPath), sub)); err == nil && len(entries) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeMDMode(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "off", "larder", "storage":
-		return strings.ToLower(strings.TrimSpace(s))
+	case "item":
+		return "item"
+	case "larder":
+		return "larder"
+	case "off":
+		return "off"
+	case "storage":
+		// 旧版 PDF 同目录：升级为“同词条下”。
+		return "item"
 	default:
-		return "storage"
+		return "item"
 	}
 }
 
@@ -838,47 +1038,71 @@ func cacheAttachment(dataDir string, att zotero.Attachment, data []byte) (string
 	return p, nil
 }
 
-// writeMarkdownSidecar 把解析后的 Markdown 写到 Zotero 目录。
-// storage：PDF 同目录；larder：<数据目录>/larder-md/<集合>/。
-var assetSidecarRE = regexp.MustCompile(`asset://([^\s)]+)`)
-
-func writeMarkdownSidecar(dataDir, mode, collectionName string, att zotero.Attachment, item zotero.Item, markdown, assetsDir string) (string, error) {
-	if strings.TrimSpace(dataDir) == "" || strings.TrimSpace(markdown) == "" {
-		return "", fmt.Errorf("数据目录或内容为空")
+// sidecarTarget 计算解析 Markdown 的落盘目录。
+// item：优先放在 PDF 所在的 Zotero storage/<attachmentKey>/ 下，并在词条下创建子附件；
+// 没有 storage 目录时退回 Zotero/larder/。larder：只用 Zotero/larder/。
+func sidecarTarget(dataDir, mode, collectionName string, att zotero.Attachment, item zotero.Item) (dir, name string, ok bool) {
+	mode = normalizeMDMode(mode)
+	if mode == "off" || strings.TrimSpace(dataDir) == "" {
+		return "", "", false
 	}
 	title := sanitizeFileName(item.Title)
 	if title == "" {
-		title = item.Key
+		title = sanitizeFileName(item.Key)
 	}
-	var dir, name string
-	switch mode {
-	case "larder":
-		dir = filepath.Join(dataDir, "larder-md", sanitizeFileName(collectionName))
-		name = title + " [" + item.Key + "].md"
-	case "off":
-		return "", nil
-	default: // storage
-		if att.Key == "" {
-			return "", fmt.Errorf("没有附件 key，无法写入 PDF 同目录")
+	if title == "" {
+		title = "document"
+	}
+	key := sanitizeFileName(item.Key)
+	if key == "" {
+		key = "item"
+	}
+	if mode == "item" && strings.TrimSpace(att.Key) != "" {
+		candidate := filepath.Join(dataDir, "storage", att.Key)
+		if strings.HasPrefix(strings.TrimSpace(att.Path), "storage:") {
+			dir = candidate
+		} else if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
+			dir = candidate
 		}
-		dir = filepath.Join(dataDir, "storage", att.Key)
-		name = title + ".md"
+	}
+	if dir == "" {
+		dir = filepath.Join(dataDir, "larder", sanitizeFileName(collectionName), title+" ["+key+"]")
+	}
+	return dir, title + ".md", true
+}
+
+// existingSidecar 返回已存在的解析 Markdown 及其修改时间。
+func existingSidecar(dataDir, mode, collectionName string, att zotero.Attachment, item zotero.Item) (string, time.Time, bool) {
+	dir, name, ok := sidecarTarget(dataDir, mode, collectionName, att, item)
+	if !ok {
+		return "", time.Time{}, false
+	}
+	p := filepath.Join(dir, name)
+	fi, err := os.Stat(p)
+	if err != nil || fi.IsDir() || fi.Size() == 0 {
+		return "", time.Time{}, false
+	}
+	return p, fi.ModTime(), true
+}
+
+// writeMarkdownSidecar 把解析后的 Markdown 写到 Zotero 目录。
+// item：storage/<attachmentKey>/<标题>.md；larder：Zotero/larder/<集合>/<标题 [itemKey]>/<标题>.md。
+// 图片统一放在 Markdown 同目录的 image/ 下，并把 asset:// 改成相对路径。
+func writeMarkdownSidecar(dataDir, mode, collectionName string, att zotero.Attachment, item zotero.Item, markdown, assetsDir string) (string, error) {
+	if strings.TrimSpace(markdown) == "" {
+		return "", fmt.Errorf("解析内容为空")
+	}
+	dir, name, ok := sidecarTarget(dataDir, mode, collectionName, att, item)
+	if !ok {
+		return "", nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+	p := filepath.Join(dir, name)
+	markdown = normalizeSidecarLayout(p, markdown)
 	if assetsDir != "" {
 		markdown = copyAssetsToSidecar(assetsDir, dir, markdown)
-	}
-	p := filepath.Join(dir, name)
-	// larder 模式下不同论文可能同名：追加 item key，避免互相覆盖。
-	// storage 模式目录已按附件 key 隔离，同一篇论文更新时直接覆盖。
-	if mode != "storage" {
-		if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
-			if old, rerr := os.ReadFile(p); rerr == nil && string(old) != markdown {
-				p = filepath.Join(dir, title+" ["+item.Key+"].md")
-			}
-		}
 	}
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, []byte(markdown), 0o644); err != nil {
@@ -891,7 +1115,9 @@ func writeMarkdownSidecar(dataDir, mode, collectionName string, att zotero.Attac
 	return p, nil
 }
 
-// copyAssetsToSidecar 把 asset:// 图片复制到 Markdown 同目录的 images/，
+var assetSidecarRE = regexp.MustCompile(`asset://([^\s)]+)`)
+
+// copyAssetsToSidecar 把 asset:// 图片复制到 Markdown 同目录的 image/，
 // 并把引用改成相对路径，保证导出的 Markdown 可以脱离 Larder 打开。
 func copyAssetsToSidecar(assetsDir, mdDir, markdown string) string {
 	names := map[string]bool{}
@@ -903,7 +1129,7 @@ func copyAssetsToSidecar(assetsDir, mdDir, markdown string) string {
 	if len(names) == 0 {
 		return markdown
 	}
-	imageDir := filepath.Join(mdDir, "images")
+	imageDir := filepath.Join(mdDir, "image")
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return markdown
 	}
@@ -922,8 +1148,89 @@ func copyAssetsToSidecar(assetsDir, mdDir, markdown string) string {
 		if _, err := os.Stat(filepath.Join(imageDir, name)); err != nil {
 			return m
 		}
-		return "images/" + name
+		return "image/" + name
 	})
+}
+
+var sidecarImageRE = regexp.MustCompile(`\]\(images?/([^)\s]+)(?:\s+"[^"]*")?\)`)
+
+// sidecarMarkdownForIngest 把 sidecar 里的 image/ 相对路径改成 asset://，
+// 并返回需要复制到知识库 image/<docID>/ 的图片名。
+func sidecarMarkdownForIngest(markdown string) (string, []string) {
+	names := map[string]bool{}
+	for _, m := range sidecarImageRE.FindAllStringSubmatch(markdown, -1) {
+		if len(m) == 2 && m[1] != "" && !strings.ContainsAny(m[1], `/\`) {
+			names[m[1]] = true
+		}
+	}
+	if len(names) == 0 {
+		return markdown, nil
+	}
+	out := sidecarImageRE.ReplaceAllString(markdown, `](asset://$1)`)
+	list := make([]string, 0, len(names))
+	for name := range names {
+		list = append(list, name)
+	}
+	sort.Strings(list)
+	return out, list
+}
+
+var oldSidecarImageRE = regexp.MustCompile(`\]\(images/`)
+
+// normalizeSidecarLayout 把旧版 images/ 目录和引用迁移到用户要求的 image/。
+func normalizeSidecarLayout(mdPath, markdown string) string {
+	dir := filepath.Dir(mdPath)
+	oldDir := filepath.Join(dir, "images")
+	newDir := filepath.Join(dir, "image")
+	if fi, err := os.Stat(oldDir); err == nil && fi.IsDir() {
+		_ = os.MkdirAll(newDir, 0o755)
+		if entries, err := os.ReadDir(oldDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				src := filepath.Join(oldDir, e.Name())
+				dst := filepath.Join(newDir, e.Name())
+				if _, err := os.Stat(dst); os.IsNotExist(err) {
+					_ = os.Rename(src, dst)
+				}
+			}
+		}
+		_ = os.Remove(oldDir)
+	}
+	if strings.Contains(markdown, "](images/") {
+		markdown = oldSidecarImageRE.ReplaceAllString(markdown, "](image/")
+	}
+	return markdown
+}
+
+// copySidecarImages 把 sidecar 同目录 image/ 下的图片复制到知识库 image/<docID>/。
+func copySidecarImages(mdPath, kbDataDir, docID string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	base := filepath.Dir(mdPath)
+	dstDir := filepath.Join(kbDataDir, "image", docID)
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return
+	}
+	for _, name := range names {
+		if name == "" || strings.ContainsAny(name, `/\`) {
+			continue
+		}
+		var b []byte
+		var err error
+		for _, sub := range []string{"image", "images"} {
+			b, err = os.ReadFile(filepath.Join(base, sub, name))
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			continue
+		}
+		_ = os.WriteFile(filepath.Join(dstDir, name), b, 0o644)
+	}
 }
 
 func sanitizeFileName(s string) string {

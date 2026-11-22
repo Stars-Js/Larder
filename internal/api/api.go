@@ -2,6 +2,8 @@
 package api
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -134,7 +136,7 @@ func Handler(d Deps) http.Handler {
 	// 引用格式预览：用固定样例按当前参考文献格式生成正文标记与文末条目。
 	mux.HandleFunc("GET /api/citation/preview", func(w http.ResponseWriter, r *http.Request) {
 		cfg := d.Services.Config()
-		style := cite.NormalizeStyle(firstNonEmptyStr(r.URL.Query().Get("style"), cfg.Citation.ReferenceStyle, cfg.Zotero.CiteStyle))
+		style := cite.NormalizeStyle(firstNonEmptyStr(r.URL.Query().Get("style"), cfg.Citation.Style("default").ReferenceStyle, cfg.Zotero.CiteStyle))
 		it := citationPreviewItem()
 		ref := cite.Format(it, style)
 		mark := cite.InText(it, 1, style)
@@ -383,6 +385,30 @@ func Handler(d Deps) http.Handler {
 			writeError(w, http.StatusBadRequest, errors.New("kind 必须是 embed/rerank/parse"))
 		}
 	})
+	// 引用格式单独保存：不依赖设置页 DOM，切换页面/马上对话也能立即生效。
+	mux.HandleFunc("PUT /api/citation", func(w http.ResponseWriter, r *http.Request) {
+		var c config.CitationConfig
+		// 旧前端可能仍回传 version；版本字段已删除，这里宽松解码并忽略。
+		if err := decodeJSONLenient(r, &c); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		cfg := d.Services.Config()
+		cfg.Citation = c
+		config.NormalizeCitation(&cfg.Citation)
+		if err := d.Services.Update(cfg); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if d.SaveConfig != nil {
+			if err := d.SaveConfig(cfg); err != nil {
+				d.Logger.Warn("保存引用设置失败", "err", err)
+			}
+		}
+		d.Manager.ApplyConfig(cfg)
+		writeJSON(w, http.StatusOK, cfg.Citation)
+	})
+
 	mux.HandleFunc("PUT /api/settings", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		var dto settingsDTO
@@ -654,14 +680,17 @@ func Handler(d Deps) http.Handler {
 				fileKind = strings.TrimPrefix(strings.ToLower(filepath.Ext(doc.OriginPath)), ".")
 			}
 		}
+		mdPath, hasMD := sidecarPathForDoc(r.Context(), a, id)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"document": doc, "markdown": markdown, "chunks": chunks, "reconstructed": reconstructed,
 			"has_file": hasFile, "file_name": fileName, "file_kind": fileKind,
+			"has_md": hasMD, "md_path": mdPath,
 		})
 	})
-	// 解析图片：MinerU/Docling 抽出的图片按文档存在 data/.assets/<docID>/。
+	// 解析图片：MinerU/Docling 抽出的图片按文档存在 data/<知识库>/image/<docID>/。
 	mux.HandleFunc("GET /api/kbs/{kb}/documents/{id}/assets/{name}", func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := d.getApp(w, r); !ok {
+		a, ok := d.getApp(w, r)
+		if !ok {
 			return
 		}
 		name := r.PathValue("name")
@@ -669,13 +698,161 @@ func Handler(d Deps) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		path := filepath.Join(d.Services.Config().Storage.Dir, ".assets", r.PathValue("id"), filepath.Base(name))
+		id := r.PathValue("id")
+		path := filepath.Join(a.DataDir, "image", id, filepath.Base(name))
+		if _, err := os.Stat(path); err != nil {
+			// Zotero item/larder 模式：图片与 Markdown 一起保存在 Zotero sidecar 的 image/ 下，
+			// 此时知识库目录不再保留重复图片，直接回退到 sidecar 目录提供预览。
+			if mdPath, ok := sidecarPathForDoc(r.Context(), a, id); ok {
+				for _, sub := range []string{"image", "images"} {
+					p := filepath.Join(filepath.Dir(mdPath), sub, filepath.Base(name))
+					if _, err := os.Stat(p); err == nil {
+						path = p
+						break
+					}
+				}
+			}
+		}
 		if _, err := os.Stat(path); err != nil {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		http.ServeFile(w, r, path)
+	})
+
+	// 导出解析后的 Markdown + image/ 图片；普通知识库不落盘，但可随时导出。
+	mux.HandleFunc("GET /api/kbs/{kb}/documents/{id}/export.zip", func(w http.ResponseWriter, r *http.Request) {
+		a, ok := d.getApp(w, r)
+		if !ok {
+			return
+		}
+		id := r.PathValue("id")
+		doc, found, err := a.Store.GetDocument(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, errors.New("文档不存在"))
+			return
+		}
+		markdown, merr := a.Store.GetDocumentMarkdown(r.Context(), id)
+		if merr != nil && !errors.Is(merr, sql.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, merr)
+			return
+		}
+		if strings.TrimSpace(markdown) == "" {
+			chunks, _ := a.Store.ListChunks(r.Context(), id)
+			markdown = reconstructMarkdown(chunks)
+		}
+		markdown = assetRefRE.ReplaceAllStringFunc(markdown, func(m string) string {
+			name := strings.TrimPrefix(m, "asset://")
+			return "image/" + name
+		})
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		name := safeExportFileName(doc.Title, id) + ".md"
+		f, zerr := zw.Create(name)
+		if zerr != nil {
+			writeError(w, http.StatusInternalServerError, zerr)
+			return
+		}
+		if _, zerr = f.Write([]byte(markdown)); zerr != nil {
+			writeError(w, http.StatusInternalServerError, zerr)
+			return
+		}
+		seen := map[string]bool{}
+		for _, m := range assetRefRE.FindAllStringSubmatch(markdown, -1) {
+			if len(m) < 2 {
+				continue
+			}
+			img := m[1]
+			if img == "" || seen[img] || strings.ContainsAny(img, `/\`) {
+				continue
+			}
+			seen[img] = true
+			imgPath, iok := documentImagePath(r.Context(), a, id, img)
+			if !iok {
+				continue
+			}
+			b, rerr := os.ReadFile(imgPath)
+			if rerr != nil {
+				continue
+			}
+			zf, zerr := zw.Create("image/" + img)
+			if zerr != nil {
+				continue
+			}
+			_, _ = zf.Write(b)
+		}
+		if zerr := zw.Close(); zerr != nil {
+			writeError(w, http.StatusInternalServerError, zerr)
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{
+			"filename": safeExportFileName(doc.Title, id) + ".zip",
+		}))
+		_, _ = w.Write(buf.Bytes())
+	})
+
+	// 打开文档所在目录（PDF 原始文件目录或解析 Markdown 目录）。
+	mux.HandleFunc("POST /api/kbs/{kb}/documents/{id}/open-folder", func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopback(r) {
+			writeError(w, http.StatusForbidden, errors.New("仅允许本机调用"))
+			return
+		}
+		a, ok := d.getApp(w, r)
+		if !ok {
+			return
+		}
+		var req struct {
+			Kind string `json:"kind"`
+		}
+		_ = decodeJSON(r, &req)
+		id := r.PathValue("id")
+		doc, found, err := a.Store.GetDocument(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, errors.New("文档不存在"))
+			return
+		}
+		target := ""
+		kind := strings.ToLower(strings.TrimSpace(req.Kind))
+		if kind == "" {
+			kind = "pdf"
+		}
+		switch kind {
+		case "md":
+			p, has := sidecarPathForDoc(r.Context(), a, id)
+			if !has {
+				writeError(w, http.StatusNotFound, errors.New("该文档没有已保存的解析 Markdown 文件"))
+				return
+			}
+			target = p
+		case "pdf", "file", "":
+			if strings.TrimSpace(doc.OriginPath) == "" || doc.OriginType == "url" {
+				writeError(w, http.StatusNotFound, errors.New("该文档没有本地原始文件"))
+				return
+			}
+			target = doc.OriginPath
+		default:
+			writeError(w, http.StatusBadRequest, errors.New("kind 必须是 md/pdf"))
+			return
+		}
+		if _, err := os.Stat(target); err != nil {
+			writeError(w, http.StatusNotFound, errors.New("文件已不存在"))
+			return
+		}
+		if err := openInFileManager(target); err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"path": filepath.Dir(target), "kind": kind})
 	})
 
 	// 原始文件：PDF 在预览标签页内嵌阅读，其它格式可直接下载。
@@ -849,7 +1026,7 @@ func Handler(d Deps) http.Handler {
 		ctx, cancel := extendIngest(w, r)
 		defer cancel()
 		start := time.Now()
-		res, err := a.Ingest.IngestFile(ctx, req.Path, ingest.Options{Title: req.Title, Refresh: req.Refresh})
+		res, err := a.Ingest.IngestFile(ctx, req.Path, ingest.Options{Title: req.Title, Refresh: req.Refresh, CopySource: true})
 		if err != nil {
 			d.record("入库", r.PathValue("kb"), firstNonEmptyStr(req.Title, req.Path), "error", err.Error(), start)
 			writeIngestError(w, res, err)
@@ -879,7 +1056,7 @@ func Handler(d Deps) http.Handler {
 		ctx, cancel := extendIngest(w, r)
 		defer cancel()
 		start := time.Now()
-		res, err := a.Ingest.IngestURL(ctx, req.URL, ingest.Options{Title: req.Title, Refresh: req.Refresh})
+		res, err := a.Ingest.IngestURL(ctx, req.URL, ingest.Options{Title: req.Title, Refresh: req.Refresh, CopySource: true})
 		if err != nil {
 			d.record("入库", r.PathValue("kb"), firstNonEmptyStr(req.Title, req.URL), "error", err.Error(), start)
 			writeIngestError(w, res, err)
@@ -926,16 +1103,21 @@ func Handler(d Deps) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"theme": theme})
 	})
 	mux.HandleFunc("GET /api/zotero/settings", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, d.Services.Config().Zotero)
+		writeJSON(w, http.StatusOK, zoteroSettingsDTO(d.Services.Config().Zotero))
 	})
 	mux.HandleFunc("PUT /api/zotero/settings", func(w http.ResponseWriter, r *http.Request) {
 		var z config.ZoteroConfig
-		if err := decodeJSON(r, &z); err != nil {
+		// 允许客户端回传 GET 中的 write_authorized/key_masked 等只读字段。
+		if err := decodeJSONLenient(r, &z); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		config.NormalizeZotero(&z)
 		cfg := d.Services.Config()
+		// 界面不会回传密钥；空值或掩码表示保留已授权密钥。
+		if strings.TrimSpace(z.LocalAPIKey) == "" || strings.HasPrefix(strings.TrimSpace(z.LocalAPIKey), "•") {
+			z.LocalAPIKey = cfg.Zotero.LocalAPIKey
+		}
 		cfg.Zotero = z
 		if err := d.Services.Update(cfg); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -949,6 +1131,58 @@ func Handler(d Deps) http.Handler {
 		d.Manager.ApplyConfig(cfg)
 		writeJSON(w, http.StatusOK, cfg.Zotero)
 	})
+	// 授权 Zotero 本地写入（Zotero 10+）：创建词条子附件需要。
+	mux.HandleFunc("POST /api/zotero/authorize-write", func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopback(r) {
+			writeError(w, http.StatusForbidden, errors.New("仅允许本机调用"))
+			return
+		}
+		cfg := d.Services.Config()
+		dataDir := firstNonEmptyStr(cfg.Zotero.DataDir, config.DefaultZoteroDataDir())
+		c := zotero.New(zotero.Config{
+			DataDir: dataDir, APIBase: cfg.Zotero.APIBase, LibraryID: cfg.Zotero.LibraryID,
+			Timeout: 2 * time.Minute,
+		})
+		defer c.Close()
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		defer cancel()
+		auth, err := c.AuthorizeLocalWrite(ctx, "Larder")
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		cfg.Zotero.LocalAPIKey = auth.Key
+		if err := d.Services.Update(cfg); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if d.SaveConfig != nil {
+			if err := d.SaveConfig(cfg); err != nil {
+				d.Logger.Warn("保存 Zotero 写入授权失败", "err", err)
+			}
+		}
+		d.Manager.ApplyConfig(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authorized": true, "remember": auth.Remember, "write_authorized": true,
+			"key_masked": maskSecret(auth.Key),
+			"message":    "已授权 Zotero 本地写入；建议在 Zotero 弹窗中选择“始终允许”，否则密钥只能使用一次。下次同步会自动把已有 Markdown 挂到对应词条下。",
+		})
+	})
+	mux.HandleFunc("DELETE /api/zotero/authorize-write", func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopback(r) {
+			writeError(w, http.StatusForbidden, errors.New("仅允许本机调用"))
+			return
+		}
+		cfg := d.Services.Config()
+		cfg.Zotero.LocalAPIKey = ""
+		_ = d.Services.Update(cfg)
+		if d.SaveConfig != nil {
+			_ = d.SaveConfig(cfg)
+		}
+		d.Manager.ApplyConfig(cfg)
+		writeJSON(w, http.StatusOK, map[string]any{"authorized": false, "write_authorized": false})
+	})
+
 	mux.HandleFunc("GET /api/zotero/status", func(w http.ResponseWriter, r *http.Request) {
 		cfg := d.Services.Config()
 		dataDir := cfg.Zotero.DataDir
@@ -974,7 +1208,8 @@ func Handler(d Deps) http.Handler {
 			"enabled": cfg.Zotero.Enabled, "data_dir": dataDir, "detected_data_dir": detected,
 			"api_base": cfg.Zotero.APIBase, "library_id": cfg.Zotero.LibraryID, "db_available": dbAvailable,
 			"api_available": apiAvailable, "api_error": apiError,
-			"md_mode": cfg.Zotero.MDMode, "parse_mode": cfg.Zotero.ParseMode,
+			"write_authorized": strings.TrimSpace(cfg.Zotero.LocalAPIKey) != "",
+			"md_mode":          cfg.Zotero.MDMode, "parse_mode": cfg.Zotero.ParseMode,
 			"cite_style": cfg.Zotero.CiteStyle,
 			"watch":      cfg.Zotero.Watch, "watch_interval": cfg.Zotero.WatchInterval,
 		})
@@ -1026,7 +1261,7 @@ func Handler(d Deps) http.Handler {
 			return
 		}
 		meta := map[string]string{}
-		for _, k := range []string{"kb_kind", "zotero_collection_name", "zotero_collection_key", "zotero_data_dir", "zotero_api_base", "zotero_last_sync", "zotero_parse_mode", "zotero_cite_style"} {
+		for _, k := range []string{"kb_kind", "zotero_collection_name", "zotero_collection_key", "zotero_data_dir", "zotero_api_base", "zotero_last_sync", "zotero_parse_mode", "zotero_cite_style", "zotero_md_mode"} {
 			if v, found, _ := a.Store.GetMeta(r.Context(), k); found {
 				meta[k] = v
 			}
@@ -1042,8 +1277,8 @@ func Handler(d Deps) http.Handler {
 			"collection_key": meta["zotero_collection_key"], "data_dir": meta["zotero_data_dir"],
 			"api_base":  meta["zotero_api_base"],
 			"last_sync": meta["zotero_last_sync"], "parse_mode": meta["zotero_parse_mode"],
-			"cite_style": meta["zotero_cite_style"],
-			"total":      total, "synced": synced,
+			"cite_style": meta["zotero_cite_style"], "md_mode": normalizeMDModeValue(firstNonEmptyStr(meta["zotero_md_mode"], d.Services.Config().Zotero.MDMode)),
+			"total": total, "synced": synced,
 			"failed": failed, "job": job,
 		})
 	})
@@ -1075,18 +1310,44 @@ func Handler(d Deps) http.Handler {
 		}
 		if req.MDMode != "" {
 			switch strings.ToLower(req.MDMode) {
-			case "storage", "larder", "off":
+			case "item", "larder", "off":
 				_ = a.Store.SetMeta(r.Context(), "zotero_md_mode", strings.ToLower(req.MDMode))
+			case "storage":
+				_ = a.Store.SetMeta(r.Context(), "zotero_md_mode", "item")
 			default:
-				writeError(w, http.StatusBadRequest, fmt.Errorf("md_mode 必须是 storage/larder/off"))
+				writeError(w, http.StatusBadRequest, fmt.Errorf("md_mode 必须是 item/larder/off"))
 				return
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]string{
 			"parse_mode": kbMeta(r.Context(), a, "zotero_parse_mode"),
 			"cite_style": kbMeta(r.Context(), a, "zotero_cite_style"),
-			"md_mode":    kbMeta(r.Context(), a, "zotero_md_mode"),
+			"md_mode":    normalizeMDModeValue(kbMeta(r.Context(), a, "zotero_md_mode")),
 		})
+	})
+	mux.HandleFunc("POST /api/kbs/{kb}/zotero/repair-attachments", func(w http.ResponseWriter, r *http.Request) {
+		if d.Library == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("文献库服务未启用"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+		res, err := d.Library.RepairMarkdownLinks(ctx, r.PathValue("kb"))
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		if res.AuthExpired {
+			cfg := d.Services.Config()
+			cfg.Zotero.LocalAPIKey = ""
+			_ = d.Services.Update(cfg)
+			if d.SaveConfig != nil {
+				_ = d.SaveConfig(cfg)
+			}
+			d.Manager.ApplyConfig(cfg)
+			res.Message = "Zotero 授权已失效（单次授权可能已被使用）。请重新点「授权写入 Zotero」，并在弹窗中选择“始终允许”。"
+		}
+		writeJSON(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("POST /api/kbs/{kb}/zotero/sync", func(w http.ResponseWriter, r *http.Request) {
 		if d.Library == nil {
@@ -1130,7 +1391,7 @@ func Handler(d Deps) http.Handler {
 		if !ok {
 			return
 		}
-		style := cite.NormalizeStyle(firstNonEmptyStr(r.URL.Query().Get("style"), d.Services.Config().Citation.ReferenceStyle, d.Services.Config().Zotero.CiteStyle))
+		style := cite.NormalizeStyle(firstNonEmptyStr(r.URL.Query().Get("style"), d.Services.Config().Citation.Style("default").ReferenceStyle, d.Services.Config().Zotero.CiteStyle))
 		docIDs := parseCSV(r.URL.Query().Get("doc_ids"))
 		var items []model.LibraryItem
 		var err error
@@ -1174,7 +1435,7 @@ func Handler(d Deps) http.Handler {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		style := firstNonEmptyStr(d.Services.Config().Citation.ReferenceStyle, d.Services.Config().Zotero.CiteStyle)
+		style := firstNonEmptyStr(d.Services.Config().Citation.Style("default").ReferenceStyle, d.Services.Config().Zotero.CiteStyle)
 		refs := cite.BuildReferences(citeItemsFromLibrary(items), style)
 		w.Header().Set("Content-Type", "application/x-bibtex; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="references.bib"`)
@@ -1302,7 +1563,7 @@ func settingsResponse(c config.Config, configPath, mcpURL, version string) map[s
 		"rerank":             services.ToServiceDTO(c.Rerank),
 		"citation":           c.Citation,
 		"citation_platforms": config.CitationProfiles,
-		"zotero":             c.Zotero,
+		"zotero":             zoteroSettingsDTO(c.Zotero),
 	}
 }
 
@@ -1331,9 +1592,6 @@ func (dto settingsDTO) applyTo(c config.Config) (config.Config, error) {
 		return c, err
 	}
 	if dto.Citation != nil {
-		if dto.Citation.Version == 0 {
-			dto.Citation.Version = c.Citation.Version
-		}
 		c.Citation = *dto.Citation
 		config.NormalizeCitation(&c.Citation)
 	}
@@ -1392,6 +1650,17 @@ func isLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func normalizeMDModeValue(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "larder":
+		return "larder"
+	case "off":
+		return "off"
+	default:
+		return "item"
+	}
+}
+
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -1409,6 +1678,100 @@ func rewriteAssetURLs(kbID, docID, markdown string) string {
 		name := strings.TrimPrefix(m, "asset://")
 		return "/api/kbs/" + url.PathEscape(kbID) + "/documents/" + url.PathEscape(docID) + "/assets/" + url.PathEscape(name)
 	})
+}
+
+// sidecarPathForDoc 返回 Zotero 文档已保存的解析 Markdown（storage 或 larder）。
+func sidecarPathForDoc(ctx context.Context, a *app.App, docID string) (string, bool) {
+	item, ok, err := a.Store.GetLibraryItemByDocID(ctx, docID)
+	if err != nil || !ok {
+		return "", false
+	}
+	mode := normalizeMDModeValue(kbMeta(ctx, a, "zotero_md_mode"))
+	collection := firstNonEmptyStr(kbMeta(ctx, a, "zotero_collection_name"), kbMeta(ctx, a, "zotero_collection_key"))
+	zdir := firstNonEmptyStr(kbMeta(ctx, a, "zotero_data_dir"), a.Cfg.Zotero.DataDir)
+	return libsvc.ExistingSidecarForItem(zdir, mode, collection, item)
+}
+
+// documentImagePath 先找知识库 image/，再回退到 Zotero sidecar 的 image/。
+func documentImagePath(ctx context.Context, a *app.App, docID, name string) (string, bool) {
+	name = filepath.Base(name)
+	if name == "" || name == "." || strings.ContainsAny(name, `/\`) {
+		return "", false
+	}
+	p := filepath.Join(a.DataDir, "image", docID, name)
+	if _, err := os.Stat(p); err == nil {
+		return p, true
+	}
+	if mdPath, ok := sidecarPathForDoc(ctx, a, docID); ok {
+		for _, sub := range []string{"image", "images"} {
+			p := filepath.Join(filepath.Dir(mdPath), sub, name)
+			if _, err := os.Stat(p); err == nil {
+				return p, true
+			}
+		}
+	}
+	return "", false
+}
+
+// openInFileManager 直接打开文件所在目录（比 /select 更稳定，
+// 不会因为路径中的空格/中文/逗号被 Explorer 解析到错误位置）。
+func openInFileManager(file string) error {
+	dir := filepath.Dir(file)
+	if runtime.GOOS == "windows" {
+		return exec.Command("explorer.exe", dir).Start()
+	}
+	if runtime.GOOS == "darwin" {
+		return exec.Command("open", dir).Start()
+	}
+	return exec.Command("xdg-open", dir).Start()
+}
+
+func maskSecret(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= 6 {
+		return "••••"
+	}
+	return string(r[:2]) + "••••" + string(r[len(r)-4:])
+}
+
+func zoteroSettingsDTO(z config.ZoteroConfig) map[string]any {
+	return map[string]any{
+		"enabled": z.Enabled, "data_dir": z.DataDir, "api_base": z.APIBase,
+		"library_id": z.LibraryID, "md_mode": z.MDMode, "parse_mode": z.ParseMode,
+		"cite_style": z.CiteStyle, "watch": z.Watch, "watch_interval": z.WatchInterval,
+		"local_api_key": "", "write_authorized": strings.TrimSpace(z.LocalAPIKey) != "",
+		"key_masked": maskSecret(z.LocalAPIKey),
+	}
+}
+
+func safeExportFileName(title, fallback string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = fallback
+	}
+	var b strings.Builder
+	for _, r := range title {
+		switch {
+		case r < 0x20:
+			continue
+		case strings.ContainsRune(`<>:"/\|?*`, r):
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	s := strings.Trim(b.String(), " .")
+	if s == "" {
+		s = fallback
+	}
+	if r := []rune(s); len(r) > 100 {
+		s = string(r[:100])
+	}
+	return s
 }
 
 // reconstructMarkdown 为旧版本文档用切块重组一份可读的 Markdown。
@@ -1429,6 +1792,11 @@ func reconstructMarkdown(chunks []model.Chunk) string {
 }
 
 // decodeJSON 解析请求体并拒绝未知字段。
+func decodeJSONLenient(r *http.Request, v any) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
+	return dec.Decode(v)
+}
+
 func decodeJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
 	dec.DisallowUnknownFields()

@@ -18,7 +18,7 @@ import (
 )
 
 // Version 是应用版本号。
-const Version = "1.1.0"
+const Version = "1.1.1"
 
 // Overrides 是单个知识库可覆盖的全局设置（来自知识库设置）。
 type Overrides struct {
@@ -34,6 +34,7 @@ type Overrides struct {
 type App struct {
 	ID           string // 所属知识库 ID（单库模式下为空）
 	DBPath       string // 数据库文件路径
+	DataDir      string // 该知识库的数据目录（pdf/files/image/exports）
 	Cfg          config.Config
 	Store        store.Store
 	Ingest       *ingest.Service
@@ -116,13 +117,14 @@ func NewAt(cfg config.Config, id, dbPath string, sc *services.Container, logger 
 		cfg.Search.CandidateK = ov.CandidateK
 	}
 
-	uploadDir := filepath.Join(cfg.Storage.Dir, ".uploads")
-	ing := ingest.New(st, parser, layoutParser, emb, chunkOpt, cfg.Embed.Endpoint.Model, rr != nil, uploadDir)
+	dataDir := filepath.Dir(dbPath)
+	ing := ingest.New(st, parser, layoutParser, emb, chunkOpt, cfg.Embed.Endpoint.Model, rr != nil, dataDir)
 	srch := search.New(st, emb, rr, cfg.Embed.Endpoint.Model, cfg.Rerank.Endpoint.Model)
 
 	a := &App{
 		ID:           id,
 		DBPath:       dbPath,
+		DataDir:      dataDir,
 		Cfg:          cfg,
 		Store:        st,
 		Ingest:       ing,

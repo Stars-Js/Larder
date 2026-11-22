@@ -104,14 +104,16 @@
 
 Zotero 读取顺序：本地 API（`/api/users/0/...`，支持 collections/items/children/fulltext/file）→
 `zotero.sqlite` 只读快照（复制 db + wal + shm 到临时目录，避免数据库锁）。
-PDF 不复制：`documents.origin_path` 指向 Zotero storage 或 linked file；只保存解析后的 Markdown、chunks 与向量。
+Zotero PDF 不复制：`documents.origin_path` 指向 Zotero storage 或 linked file；只保存解析后的 Markdown、chunks 与向量。
+`md_mode=item` 时通过 Zotero 10+ 本地写入 API 在词条下创建 `linked_file` Markdown 子附件。
 
 ## 3. 入库流水线（`internal/ingest`）
 
 ```
 来源(文件/URL/字节)
    │
-   ├─(1) 空内容校验；计算原始字节 sha256；上传内容缓存到 data/.uploads/<hash><ext>
+   ├─(1) 空内容校验；计算原始字节 sha256；普通知识库上传缓存到
+   │      data/<知识库名>/pdf/<文件名> 或 files/<文件名>
    │
    ├─(2) 判重：FindDocByHash(source, hash) 命中且解析/嵌入都成功且非 refresh → Skipped
    │        上次失败的记录会复用，避免重复堆积
@@ -184,18 +186,22 @@ query
        主附件（PDF 优先）
        全文：Zotero /fulltext 或 .zotero-ft-cache；否则解析 PDF
        ingest：切块 → 嵌入 → 落库
-       可选：写 <标题>.md 到 Zotero storage / larder-md
+       可选：写 <标题>.md 到 Zotero storage（item）或 Zotero/larder（larder）
        写入 library_items
    → 更新 zotero_last_sync / 成功失败计数
 ```
 
 - 同步在后台 goroutine 执行，`GET /api/kbs/{id}/zotero/status` 返回实时进度。
-- 已成功的条目按 `dateModified` 跳过；失败条目保留 `sync_status=error`，下次重试。
+- 已成功的条目按 `dateModified` 跳过；已有解析 Markdown 且不比 PDF 旧时直接复用，不重复解析；
+  失败条目保留 `sync_status=error`，下次重试。
 - 引用元数据与 BibTeX 随 item 一起缓存，检索和离线导出不依赖 Zotero 在线。
 - `parse_mode=auto/layout` 时优先用 MinerU/Docling 解析 PDF，保留标题层级、表格与图片；
   `zotero` 模式只用全文缓存（纯文本，速度快）。
-- MinerU 结果中的 `images/` 保存到 `data/.assets/<docID>/`，Markdown 里改写为 `asset://name`，
-  API 返回内容时替换为可访问的 `/api/.../assets/...` 地址。
+- 知识库布局：`data/<知识库名>/<id>.db`、`pdf/`、`files/`、`image/<docID>/`、`exports/`；
+  旧版 `data/<id>.db`、`.uploads/`、`.assets/` 启动时迁移。
+- MinerU 结果中的 `images/` 保存到 `data/<知识库名>/image/<docID>/`，Markdown 里改写为 `asset://name`，
+  API 返回内容时替换为可访问的 `/api/.../assets/...` 地址。Zotero sidecar 模式还会复制到 Markdown
+  同目录的 `image/`。
 - `Watch` 每 5 秒检查 `zotero.sqlite`、`-wal`、`storage` 的 mtime/size；变化后自动触发对应文献库增量同步。
 
 ## 5. MCP 与 REST
@@ -212,7 +218,7 @@ query
   `larder_delete_document`，并保留 `larder_list_kbs` / `larder_use_kb` 兼容名。
 - 首次检索在多库且未选择时返回 `selection_required=true`；选择值按 MCP session 保存，无 session 时退化为进程级。
 - 支持 MCP elicitation 的客户端会弹出 `library` 枚举表单：新协议客户端走 `InputRequests`/MRTR，旧协议客户端（如 Cherry Studio）走 `elicitation/create`；用户点击后自动继续检索。没有 elicitation 能力的客户端回退为文本列表。
-- 检索结果为每篇论文生成 `ref_no` / `cite_mark` / `cite_link` / `reference`，并按平台引用配置生成悬浮链接或纯文本行内串；文末统一附 `reference_block`。
+- 检索结果为每篇论文生成 `ref_no` / `cite_link` / `reference`，并按平台引用配置生成悬浮链接或纯文本行内串；悬浮模式只保留 `cite_link`，纯文本模式保留标准 `cite_mark`；文末统一附 `reference_block`。
 
 ### REST（`internal/api`）
 

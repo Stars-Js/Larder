@@ -206,7 +206,8 @@ func TestMCPSelectionAndReferences(t *testing.T) {
 		t.Fatalf("expected 1 reference, got %+v (%s)", out["references"], resultText(t, res))
 	}
 	ref := refs[0].(map[string]any)
-	if ref["cite_mark"] != "[1]" || ref["ref_no"] != float64(1) {
+	mark, _ := ref["cite_link"].(string)
+	if !strings.HasPrefix(mark, "[<sup>[1]</sup>](") || ref["ref_no"] != float64(1) {
 		t.Fatalf("unexpected ref: %+v", ref)
 	}
 	if !strings.Contains(resultText(t, res), "## 参考文献") || !strings.Contains(resultText(t, res), "[1]") {
@@ -216,8 +217,9 @@ func TestMCPSelectionAndReferences(t *testing.T) {
 	if len(results) == 0 {
 		t.Fatal("expected results")
 	}
-	if results[0].(map[string]any)["ref_mark"] != "[1]" {
-		t.Fatalf("result ref_mark missing: %+v", results[0])
+	refMark, _ := results[0].(map[string]any)["cite_link"].(string)
+	if !strings.HasPrefix(refMark, "[<sup>[1]</sup>](") {
+		t.Fatalf("result cite_link missing sup hover link: %+v", results[0])
 	}
 
 	// 3. 悬浮模式：链接文字是文内标记，title 包含文献词条和原文。
@@ -231,7 +233,7 @@ func TestMCPSelectionAndReferences(t *testing.T) {
 		t.Fatal("expected hover references")
 	}
 	hoverLink := hoverRefs[0].(map[string]any)["cite_link"].(string)
-	if !strings.HasPrefix(hoverLink, "[[1]](") || !strings.Contains(hoverLink, "【文献词条】") || !strings.Contains(hoverLink, "【原文】") {
+	if !strings.HasPrefix(hoverLink, "[<sup>[1]</sup>](") || !strings.Contains(hoverLink, "【文献词条】") || !strings.Contains(hoverLink, "【原文】") {
 		t.Fatalf("unexpected hover link: %s", hoverLink)
 	}
 
@@ -247,7 +249,7 @@ func TestMCPSelectionAndReferences(t *testing.T) {
 
 	// 5. 显式取参考文献与 BibTeX。
 	docID := ref["doc_id"].(string)
-	res = callTool(t, session, "larder_get_references", map[string]any{"kb": env.kb1, "doc_ids": docID})
+	res = callTool(t, session, "larder_get_references", map[string]any{"kb": env.kb1, "doc_ids": docID, "include_bibtex": true})
 	if res.IsError {
 		t.Fatalf("get refs: %s", resultText(t, res))
 	}
@@ -293,7 +295,6 @@ func TestMCPSelectionAndReferences(t *testing.T) {
 func TestMCPPlainCitationZCode(t *testing.T) {
 	env := setupMCPEnv(t)
 	cfg := env.mgr.Config()
-	cfg.Citation.Version = 5
 	cfg.Citation.Profiles["zcode"] = config.CitationStyle{
 		Mode: "plain", Fields: []string{"link", "reference", "file", "text"},
 	}
@@ -331,7 +332,6 @@ func TestMCPPlainCitationZCode(t *testing.T) {
 func TestMCPPlainCitationCherryStudio(t *testing.T) {
 	env := setupMCPEnv(t)
 	cfg := env.mgr.Config()
-	cfg.Citation.Version = 5
 	cfg.Citation.Profiles["cherrystudio"] = config.CitationStyle{
 		Mode: "plain", Fields: []string{"reference", "link", "file", "text"},
 	}
@@ -508,7 +508,6 @@ func TestMCPDirectElicitsLibrarySelection(t *testing.T) {
 func TestMCPUsesCitationReferenceStyle(t *testing.T) {
 	env := setupMCPEnv(t)
 	cfg := env.mgr.Config()
-	cfg.Citation.ReferenceStyle = "ieee"
 	profile := cfg.Citation.Profiles["default"]
 	profile.ReferenceStyle = "apa"
 	cfg.Citation.Profiles["default"] = profile
@@ -534,7 +533,6 @@ func TestMCPUsesCitationReferenceStyle(t *testing.T) {
 func TestMCPPerAgentCitationStyles(t *testing.T) {
 	env := setupMCPEnv(t)
 	cfg := env.mgr.Config()
-	cfg.Citation.ReferenceStyle = "gb-t-7714-numeric"
 	def := cfg.Citation.Profiles["default"]
 	def.ReferenceStyle = "apa"
 	cfg.Citation.Profiles["default"] = def
@@ -564,5 +562,74 @@ func TestMCPPerAgentCitationStyles(t *testing.T) {
 	}
 	if got := search("/mcp?client=cherrystudio"); !strings.Contains(got, "\"Attention Is All You Need,\"") {
 		t.Fatalf("cherry profile should use IEEE: %s", got)
+	}
+}
+
+func TestMCPGetReferencesHoverLink(t *testing.T) {
+	env := setupMCPEnv(t)
+	srv := mcp.New(env.mgr, env.lib, "http://127.0.0.1:8765", env.act)
+	session := connectClientAt(t, srv, "/mcp?client=cherrystudio")
+
+	list := callTool(t, session, "larder_list_documents", map[string]any{"kb": env.kb1})
+	if list.IsError {
+		t.Fatalf("list docs: %s", resultText(t, list))
+	}
+	docs, _ := structured(t, list)["documents"].([]any)
+	if len(docs) == 0 {
+		t.Fatal("expected documents")
+	}
+	docID, _ := docs[0].(map[string]any)["doc_id"].(string)
+	res := callTool(t, session, "larder_get_references", map[string]any{"kb": env.kb1, "doc_ids": docID})
+	if res.IsError {
+		t.Fatalf("get refs: %s", resultText(t, res))
+	}
+	refs, _ := structured(t, res)["references"].([]any)
+	if len(refs) == 0 {
+		t.Fatal("expected references")
+	}
+	ref := refs[0].(map[string]any)
+	link, _ := ref["cite_link"].(string)
+	if !strings.HasPrefix(link, "[<sup>[1]</sup>](") || !strings.Contains(link, `"【文献词条】`) || !strings.Contains(link, "【原文】") {
+		t.Fatalf("get_references should expose hover link: %s", link)
+	}
+	if !strings.Contains(resultText(t, res), "上方「正文引用」表") {
+		t.Fatalf("missing hover citation hint: %s", resultText(t, res))
+	}
+}
+
+func TestMCPSettingsApplyToExistingSession(t *testing.T) {
+	env := setupMCPEnv(t)
+	cfg := env.mgr.Config()
+	p := cfg.Citation.Profiles["default"]
+	p.ReferenceStyle = "apa"
+	cfg.Citation.Profiles["default"] = p
+	env.mgr.ApplyConfig(cfg)
+	srv := mcp.New(env.mgr, env.lib, "http://127.0.0.1:8765", env.act)
+	session := connectClientAt(t, srv, "/mcp?client=default")
+
+	searchRef := func() string {
+		res := callTool(t, session, "larder_search", map[string]any{"query": "transformer", "kb": env.kb1})
+		if res.IsError {
+			t.Fatalf("search: %s", resultText(t, res))
+		}
+		refs, _ := structured(t, res)["references"].([]any)
+		if len(refs) == 0 {
+			t.Fatal("expected references")
+		}
+		text, _ := refs[0].(map[string]any)["reference"].(string)
+		return text
+	}
+	if got := searchRef(); !strings.Contains(got, "(2017).") {
+		t.Fatalf("initial style should be APA: %s", got)
+	}
+
+	// 不新建 MCP 会话，直接改配置后再次检索。
+	cfg = env.mgr.Config()
+	p = cfg.Citation.Profiles["default"]
+	p.ReferenceStyle = "ieee"
+	cfg.Citation.Profiles["default"] = p
+	env.mgr.ApplyConfig(cfg)
+	if got := searchRef(); !strings.Contains(got, `"Attention Is All You Need,"`) {
+		t.Fatalf("existing session should pick up new style: %s", got)
 	}
 }

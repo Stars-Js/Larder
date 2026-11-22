@@ -52,7 +52,7 @@ func setup(t *testing.T) (store.Store, *switchParser, *switchEmbedder, *ingest.S
 	t.Cleanup(func() { st.Close() })
 	p := &switchParser{fail: true}
 	e := &switchEmbedder{fail: true, dim: 4}
-	svc := ingest.New(st, p, nil, e, chunk.Options{MaxRunes: 200, Overlap: 20, MinRunes: 10}, "fake-embed", false, filepath.Join(dir, "uploads"))
+	svc := ingest.New(st, p, nil, e, chunk.Options{MaxRunes: 200, Overlap: 20, MinRunes: 10}, "fake-embed", false, dir)
 	return st, p, e, svc
 }
 

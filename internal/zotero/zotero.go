@@ -23,6 +23,7 @@ type Config struct {
 	DataDir   string        // Zotero 数据目录（包含 zotero.sqlite 和 storage/）
 	APIBase   string        // 本地 API 地址，默认 http://127.0.0.1:23119/api
 	LibraryID string        // 0=个人库；群组库填 groupID
+	APIKey    string        // Zotero 10+ 本地 API 写入密钥（可为空；写操作需要）
 	Timeout   time.Duration // 单次请求超时
 	ForceDB   bool          // 强制使用 SQLite（测试/调试）
 }

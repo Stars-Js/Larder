@@ -122,6 +122,8 @@ type Store interface {
 	UpsertDocument(ctx context.Context, doc Document) error
 	// SetDocumentStatus 更新处理流水线状态（解析/向量化/重排）。
 	SetDocumentStatus(ctx context.Context, docID string, st DocStatus) error
+	// SetDocumentOrigin 更新文档原始文件路径与来源类型。
+	SetDocumentOrigin(ctx context.Context, docID, originPath, originType string) error
 	// DeleteDocumentsByOriginExcept 删除同一原始文件/URL 的其它旧版本文档。
 	DeleteDocumentsByOriginExcept(ctx context.Context, originPath, keepID string) error
 	// ReplaceChunks 用新切块替换某文档的全部切块（含向量）。

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -36,14 +37,15 @@ type Service struct {
 	chunkOpt      chunk.Options
 	embedModel    string
 	rerankEnabled bool
-	uploadDir     string
+	dataDir       string
 	http          *http.Client
 }
 
 // New 创建入库服务。embedModel 仅用于记录（展示向量化所用模型），
-// rerankEnabled 表示入库时是否启用重排，写入文档状态；uploadDir 用于缓存上传原文件，
-// 便于解析失败后配置好服务再“重新处理”。layoutParser 可为 nil。
-func New(st store.Store, parser, layoutParser parse.Parser, embedder embed.Embedder, chunkOpt chunk.Options, embedModel string, rerankEnabled bool, uploadDir string) *Service {
+// rerankEnabled 表示入库时是否启用重排，写入文档状态；dataDir 是该知识库的数据目录，
+// 原始 PDF 存到 dataDir/pdf，其它源文件存到 dataDir/files，解析图片存到 dataDir/image/<docID>。
+// layoutParser 可为 nil。
+func New(st store.Store, parser, layoutParser parse.Parser, embedder embed.Embedder, chunkOpt chunk.Options, embedModel string, rerankEnabled bool, dataDir string) *Service {
 	return &Service{
 		store:         st,
 		parser:        parser,
@@ -52,7 +54,7 @@ func New(st store.Store, parser, layoutParser parse.Parser, embedder embed.Embed
 		chunkOpt:      chunkOpt,
 		embedModel:    embedModel,
 		rerankEnabled: rerankEnabled,
-		uploadDir:     uploadDir,
+		dataDir:       dataDir,
 		http:          &http.Client{Timeout: 120 * time.Second},
 	}
 }
@@ -64,6 +66,9 @@ type Options struct {
 	// PreferExternal 为 true 且配置了外部版面解析器时，优先用它解析 PDF，
 	// 以保留标题层级、版式、表格与图片。
 	PreferExternal bool
+	// CopySource 为 true 时把本地源文件复制到知识库数据目录（普通知识库上传）。
+	// Zotero 同步保持源 PDF 留在 Zotero，不复制。
+	CopySource bool
 	// 以下字段由服务内部在“重新处理”时使用。
 	DocID      string
 	OriginPath string
@@ -112,6 +117,12 @@ func (s *Service) IngestFile(ctx context.Context, path string, opt Options) (Res
 	}
 	opt.OriginPath = abs
 	opt.OriginType = "file"
+	if opt.CopySource {
+		if cached, cerr := s.cacheUpload(data, filepath.Base(abs), mimeFromName(abs)); cerr == nil {
+			opt.OriginPath = cached
+			opt.OriginType = "upload"
+		}
+	}
 	return s.ingestBytes(ctx, abs, filepath.Base(abs), "", data, opt)
 }
 
@@ -123,6 +134,12 @@ func (s *Service) IngestURL(ctx context.Context, url string, opt Options) (Resul
 	}
 	opt.OriginPath = url
 	opt.OriginType = "url"
+	if opt.CopySource {
+		if cached, cerr := s.cacheUpload(data, name, mime); cerr == nil {
+			opt.OriginPath = cached
+			opt.OriginType = "upload"
+		}
+	}
 	return s.ingestBytes(ctx, url, name, mime, data, opt)
 }
 
@@ -132,7 +149,7 @@ func (s *Service) IngestData(ctx context.Context, source, fileName, mime string,
 	if source == "" {
 		source = fileName
 	}
-	if cached, err := s.cacheUpload(data, fileName); err == nil {
+	if cached, err := s.cacheUpload(data, fileName, mime); err == nil {
 		opt.OriginPath = cached
 		opt.OriginType = "upload"
 	} else {
@@ -218,20 +235,35 @@ func (s *Service) downloadURL(ctx context.Context, url string) (data []byte, mim
 	return data, resp.Header.Get("Content-Type"), fileNameFromURL(url), nil
 }
 
-func (s *Service) cacheUpload(data []byte, fileName string) (string, error) {
-	if s.uploadDir == "" {
-		return "", fmt.Errorf("未配置上传缓存目录")
+func (s *Service) cacheUpload(data []byte, fileName, mime string) (string, error) {
+	if strings.TrimSpace(s.dataDir) == "" {
+		return "", fmt.Errorf("未配置知识库数据目录")
 	}
-	if err := os.MkdirAll(s.uploadDir, 0o755); err != nil {
+	dir := filepath.Join(s.dataDir, "files")
+	if strings.EqualFold(filepath.Ext(fileName), ".pdf") || strings.Contains(strings.ToLower(mime), "pdf") {
+		dir = filepath.Join(s.dataDir, "pdf")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	ext := strings.ToLower(filepath.Ext(fileName))
+	name := safeSourceName(fileName)
+	ext := strings.ToLower(filepath.Ext(name))
 	if len(ext) > 12 {
 		ext = ""
 	}
-	p := filepath.Join(s.uploadDir, hashBytes(data)+ext)
+	if name == "" {
+		name = hashBytes(data) + ext
+	}
+	p := filepath.Join(dir, name)
 	if fileExists(p) {
-		return p, nil
+		if b, err := os.ReadFile(p); err == nil && hashBytes(b) == hashBytes(data) {
+			return p, nil
+		}
+		base := strings.TrimSuffix(name, ext)
+		p = filepath.Join(dir, base+"-"+hashBytes(data)[:8]+ext)
+		if fileExists(p) {
+			return p, nil
+		}
 	}
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
@@ -242,6 +274,45 @@ func (s *Service) cacheUpload(data []byte, fileName string) (string, error) {
 		return "", err
 	}
 	return p, nil
+}
+
+func mimeFromName(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pdf":
+		return "application/pdf"
+	case ".md", ".markdown":
+		return "text/markdown"
+	case ".html", ".htm":
+		return "text/html"
+	case ".txt":
+		return "text/plain"
+	}
+	return ""
+}
+
+func safeSourceName(name string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 0x20:
+			continue
+		case strings.ContainsRune(`<>:"/\|?*`, r):
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.Trim(b.String(), " .")
+	if utf8.RuneCountInString(out) > 120 {
+		ext := filepath.Ext(out)
+		base := strings.TrimSuffix(out, ext)
+		out = string([]rune(base)[:100]) + ext
+	}
+	return out
 }
 
 // ingestPrep 保存判重与 pending 落库后的中间状态，供“解析后”和“直接 Markdown”复用。
@@ -523,13 +594,13 @@ func (s *Service) ingestParsed(ctx context.Context, source, fileName string, pre
 
 var markdownImageRE = regexp.MustCompile(`!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)`)
 
-// saveImages 把解析器抽出的图片保存到 <data>/.assets/<docID>/，
+// saveImages 把解析器抽出的图片保存到 <知识库数据目录>/image/<docID>/，
 // 并把 Markdown 中的 images/xxx 引用改写为 asset://xxx，供 API 预览时替换为可访问 URL。
 func (s *Service) saveImages(docID, markdown string, images []parse.Image) (string, error) {
-	if len(images) == 0 || strings.TrimSpace(s.uploadDir) == "" {
+	if len(images) == 0 || strings.TrimSpace(s.dataDir) == "" {
 		return markdown, nil
 	}
-	dir := filepath.Join(filepath.Dir(s.uploadDir), ".assets", docID)
+	dir := filepath.Join(s.dataDir, "image", docID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return markdown, err
 	}

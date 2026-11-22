@@ -15,6 +15,7 @@ import (
 	"larder/internal/kb"
 	"larder/internal/search"
 	"larder/internal/services"
+	"larder/internal/store"
 
 	"log/slog"
 )
@@ -161,5 +162,82 @@ func TestMultiLibraryIsolation(t *testing.T) {
 	infos, _ = mgr.List(ctx)
 	if len(infos) != 1 || infos[0].ID != a.ID {
 		t.Fatalf("删除后期望仅剩库 A，实际 %+v", infos)
+	}
+}
+
+func TestLegacyLayoutMigration(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	legacyDB := filepath.Join(dir, "kb1.db")
+	st, err := store.Open(legacyDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMeta(ctx, "kb_name", "旧版库"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".uploads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	upload := filepath.Join(dir, ".uploads", "hash.pdf")
+	if err := os.WriteFile(upload, []byte("%PDF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDocument(ctx, store.Document{ID: "doc1", Source: "paper.pdf", Title: "A", OriginPath: upload, OriginType: "upload"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	if err := os.MkdirAll(filepath.Join(dir, ".assets", "doc1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".assets", "doc1", "a.png"), []byte("PNG"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig(dir, "http://127.0.0.1:1", 4)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc, err := services.New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := kb.NewManager(cfg, svc, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	infos, err := mgr.List(ctx)
+	if err != nil || len(infos) != 1 {
+		t.Fatalf("list after migration: %+v %v", infos, err)
+	}
+	info := infos[0]
+	wantDir := filepath.Join(dir, "旧版库")
+	if info.ID != "kb1" || info.DataDir != wantDir {
+		t.Fatalf("unexpected info: %+v want dir %s", info, wantDir)
+	}
+	for _, sub := range []string{"pdf", "files", "image", "exports"} {
+		if fi, err := os.Stat(filepath.Join(wantDir, sub)); err != nil || !fi.IsDir() {
+			t.Fatalf("missing %s: %v", sub, err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(wantDir, "image", "doc1", "a.png")); err != nil || string(b) != "PNG" {
+		t.Fatalf("legacy asset not migrated: %v %q", err, string(b))
+	}
+	if b, err := os.ReadFile(filepath.Join(wantDir, "pdf", "paper.pdf")); err != nil || string(b) != "%PDF" {
+		t.Fatalf("legacy upload not copied: %v %q", err, string(b))
+	}
+	app, err := mgr.Get("kb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, ok, err := app.Store.GetDocument(ctx, "doc1")
+	if err != nil || !ok {
+		t.Fatalf("doc: %v %v", ok, err)
+	}
+	if doc.OriginPath != filepath.Join(wantDir, "pdf", "paper.pdf") {
+		t.Fatalf("origin path not updated: %s", doc.OriginPath)
+	}
+	if _, err := os.Stat(legacyDB); !os.IsNotExist(err) {
+		t.Fatalf("legacy db still exists: %v", err)
 	}
 }

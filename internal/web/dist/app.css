@@ -767,6 +767,7 @@ mark { background: rgba(214, 184, 120, .38); color: var(--fg); border-radius: 3p
 .cite-order-btns .btn { width: 27px; height: 25px; min-width: 27px; }
 .cite-preview { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--code); font-size: 11.5px; line-height: 1.65; color: var(--fg-2); background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
 .cite-preview-label { margin: 5px 0 5px; font-size: 11.5px; font-weight: 500; color: var(--muted); }
+.cite-preview sup { font-size: .72em; line-height: 0; vertical-align: super; }
 
 /* ---------- 交互日志 ---------- */
 .log-list { display: flex; flex-direction: column; gap: 8px; }
@@ -991,4 +992,43 @@ mark { background: rgba(214, 184, 120, .38); color: var(--fg); border-radius: 3p
     background-image: none;
   }
   body::after { display: none; }
+}
+
+/* ---------- v1.1.1 lightweight rendering ----------
+   默认不启用持续动画/大面积实时模糊，避免 WebView2 在空闲时持续占用 GPU。
+   莫兰迪配色、玻璃边框和层级关系保留，效果改为静态半透明表面。 */
+:root {
+  --glass: rgba(249, 246, 253, .93);
+  --glass-strong: rgba(255, 252, 255, .97);
+  --card: rgba(255, 253, 255, .95);
+  --card-2: rgba(247, 243, 252, .97);
+  --pill: rgba(240, 235, 248, .94);
+  --pill-hover: rgba(232, 225, 243, .97);
+  --glass-blur: 0px;
+  --glass-blur-strong: 0px;
+}
+:root[data-theme="dark"] {
+  --glass: rgba(28, 24, 38, .94);
+  --glass-strong: rgba(34, 29, 45, .97);
+  --card: rgba(35, 30, 46, .95);
+  --card-2: rgba(29, 24, 39, .96);
+  --pill: rgba(255, 255, 255, .07);
+  --pill-hover: rgba(255, 255, 255, .12);
+  --glass-blur: 0px;
+  --glass-blur-strong: 0px;
+}
+body {
+  background-attachment: scroll; /* fixed 背景在滚动时会反复合成整张背景 */
+}
+body::before, body::after {
+  display: none !important; /* 去掉全屏极光层和噪点层，保留 body 的静态渐变 */
+}
+.sidebar, .topbar, .card, .kb-card, .pipe-step, .result, .usage-card,
+.dropzone, .kb-new, .modal, .toast, .cselect-menu, .side-scrim,
+.modal-mask, .theme-switch, .btn, .chip {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+.logo, .nav-item.active .nav-dot, .save-state.saving i {
+  animation: none !important;
 }

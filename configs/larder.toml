@@ -89,11 +89,8 @@ qps = 8.0
 # 每个平台/agent 可单独设置 style；fields 仅用于悬浮内容，纯文本模式不使用。
 # fields: link/reference/file/text（链接、文献词条、文献文件名、原文）；
 # 悬浮模式链接固定第一项，其余顺序即悬停显示顺序。
-[citation]
-version = 5
-# 默认参考文献格式（未单独设置 style 的平台继承它）：gb-t-7714-numeric / gb-t-7714-author-date / apa / ieee / vancouver / mla
-style = 'gb-t-7714-numeric'
-
+# 参考文献格式按客户端保存；默认格式放在 citation.profiles.default.style，
+# 未单独设置 style 的平台继承它。默认：gb-t-7714-numeric。
 [citation.profiles.default]
 mode = 'markdown'
 style = 'gb-t-7714-numeric'
@@ -114,8 +111,9 @@ enabled = false
 data_dir = ''
 api_base = 'http://127.0.0.1:23119/api'
 library_id = '0'
-# storage：解析后的 MD 写到 PDF 同目录；larder：写到 <Zotero 数据目录>/larder-md/<集合>/；off：不落盘
-md_mode = 'storage'
+# item：解析 MD 写到 PDF 同目录并在 Zotero 词条下创建子附件；larder：写到 <Zotero 数据目录>/larder/<集合>/；off：不落盘
+md_mode = 'item'
+local_api_key = ''
 # auto：优先 PDF 版面解析（MinerU/Docling），失败回退 Zotero 全文；
 # layout：只用 PDF 版面解析；zotero：只用 Zotero 全文缓存（快，无图片）
 parse_mode = 'auto'

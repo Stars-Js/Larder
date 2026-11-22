@@ -33,7 +33,7 @@ func TestPreferExternalParserAndAssets(t *testing.T) {
 	defer st.Close()
 	embedder := &switchEmbedder{dim: 4}
 	svc := ingest.New(st, &switchParser{fail: true}, &layoutParser{}, embedder,
-		chunk.Options{MaxRunes: 300, Overlap: 20, MinRunes: 10}, "fake-embed", false, filepath.Join(dir, "uploads"))
+		chunk.Options{MaxRunes: 300, Overlap: 20, MinRunes: 10}, "fake-embed", false, dir)
 	ctx := context.Background()
 	res, err := svc.IngestData(ctx, "paper.pdf", "paper.pdf", "application/pdf", []byte("%PDF-1.6 fake"), ingest.Options{PreferExternal: true})
 	if err != nil {
@@ -47,8 +47,11 @@ func TestPreferExternalParserAndAssets(t *testing.T) {
 	if !strings.Contains(md, "asset://arch.png") {
 		t.Fatalf("markdown missing asset ref: %s", md)
 	}
-	asset := filepath.Join(dir, ".assets", res.DocID, "arch.png")
+	asset := filepath.Join(dir, "image", res.DocID, "arch.png")
 	if b, err := os.ReadFile(asset); err != nil || string(b) != "PNGDATA" {
 		t.Fatalf("asset not saved: %v %q", err, string(b))
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "pdf", "paper.pdf")); err != nil || string(b) != "%PDF-1.6 fake" {
+		t.Fatalf("pdf not cached under pdf/: %v %q", err, string(b))
 	}
 }

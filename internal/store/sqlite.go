@@ -259,6 +259,16 @@ func (s *SQLite) UpsertDocument(ctx context.Context, doc Document) error {
 	return nil
 }
 
+// SetDocumentOrigin 只更新原始文件路径与来源类型，保留其它字段。
+func (s *SQLite) SetDocumentOrigin(ctx context.Context, docID, originPath, originType string) error {
+	_, err := s.db.ExecContext(ctx, `update documents set origin_path=?, origin_type=?, updated_at=? where id=?`,
+		originPath, originType, time.Now().UTC().Format(time.RFC3339), docID)
+	if err != nil {
+		return fmt.Errorf("更新文档原始文件失败: %w", err)
+	}
+	return nil
+}
+
 // SetDocumentStatus 只更新处理状态字段，保留来源、标题等元信息。
 func (s *SQLite) SetDocumentStatus(ctx context.Context, docID string, st DocStatus) error {
 	_, err := s.db.ExecContext(ctx, `update documents set

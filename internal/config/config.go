@@ -76,7 +76,8 @@ type ZoteroConfig struct {
 	DataDir       string   `toml:"data_dir" json:"data_dir"`             // Zotero 数据目录（包含 zotero.sqlite）；留空自动读取 prefs.js
 	APIBase       string   `toml:"api_base" json:"api_base"`             // 本地 API 地址，默认 http://127.0.0.1:23119/api
 	LibraryID     string   `toml:"library_id" json:"library_id"`         // 个人库为 0；群组库填 groupID
-	MDMode        string   `toml:"md_mode" json:"md_mode"`               // storage（PDF 同目录）/ larder（Zotero 数据目录下）/ off
+	LocalAPIKey   string   `toml:"local_api_key" json:"local_api_key"`   // Zotero 10+ 本地 API 写入密钥（用于把解析 MD 挂到词条下）
+	MDMode        string   `toml:"md_mode" json:"md_mode"`               // item（词条子附件）/ larder（Zotero/larder）/ off
 	ParseMode     string   `toml:"parse_mode" json:"parse_mode"`         // auto（优先版面解析）/ layout（强制版面）/ zotero（只读全文缓存）
 	CiteStyle     string   `toml:"cite_style" json:"cite_style"`         // 默认参考文献样式
 	Watch         bool     `toml:"watch" json:"watch"`                   // 监听 Zotero 数据库变化并自动同步
@@ -194,11 +195,9 @@ type CitationStyle struct {
 	ReferenceStyle string   `toml:"style" json:"style"`   // 当前客户端的参考文献格式
 }
 
-// CitationConfig 按客户端平台保存引文格式。
+// CitationConfig 按客户端平台保存引文格式；默认格式在 profiles.default.style。
 type CitationConfig struct {
-	Version        int                      `toml:"version" json:"version"`
-	ReferenceStyle string                   `toml:"style" json:"style"` // 参考文献格式（全局）
-	Profiles       map[string]CitationStyle `toml:"profiles" json:"profiles"`
+	Profiles map[string]CitationStyle `toml:"profiles" json:"profiles"`
 }
 
 // CitationProfiles 是设置页展示的平台及名称。
@@ -228,7 +227,11 @@ func defaultCitationProfiles() map[string]CitationStyle {
 		if mode == "markdown" {
 			fields = defaultCitationFields
 		}
-		out[p.ID] = CitationStyle{Mode: mode, Fields: append([]string(nil), fields...)}
+		style := ""
+		if p.ID == "default" {
+			style = "gb-t-7714-numeric"
+		}
+		out[p.ID] = CitationStyle{Mode: mode, Fields: append([]string(nil), fields...), ReferenceStyle: style}
 	}
 	return out
 }
@@ -249,10 +252,17 @@ func NormalizeZotero(z *ZoteroConfig) {
 		z.LibraryID = "0"
 	}
 	switch strings.ToLower(strings.TrimSpace(z.MDMode)) {
-	case "off", "larder", "storage":
-		z.MDMode = strings.ToLower(strings.TrimSpace(z.MDMode))
+	case "item":
+		z.MDMode = "item"
+	case "larder":
+		z.MDMode = "larder"
+	case "off":
+		z.MDMode = "off"
+	case "storage":
+		// 旧版“PDF 同目录”升级为“同词条下”（Zotero 子附件）。
+		z.MDMode = "item"
 	default:
-		z.MDMode = "storage"
+		z.MDMode = "item"
 	}
 	if strings.TrimSpace(z.CiteStyle) == "" {
 		z.CiteStyle = "gb-t-7714-numeric"
@@ -273,13 +283,8 @@ func NormalizeCitation(c *CitationConfig) {
 	if c == nil {
 		return
 	}
-	if strings.TrimSpace(c.ReferenceStyle) == "" {
-		c.ReferenceStyle = "gb-t-7714-numeric"
-	}
 	if c.Profiles == nil {
 		c.Profiles = defaultCitationProfiles()
-		c.Version = 5
-		return
 	}
 	delete(c.Profiles, "generic")
 	defaults := defaultCitationProfiles()
@@ -287,6 +292,14 @@ func NormalizeCitation(c *CitationConfig) {
 		if _, ok := c.Profiles[p.ID]; !ok {
 			c.Profiles[p.ID] = defaults[p.ID]
 		}
+	}
+	if st, ok := c.Profiles["default"]; ok && strings.TrimSpace(st.ReferenceStyle) == "" {
+		st.ReferenceStyle = "gb-t-7714-numeric"
+		c.Profiles["default"] = st
+	}
+	defaultStyle := strings.TrimSpace(c.Profiles["default"].ReferenceStyle)
+	if defaultStyle == "" {
+		defaultStyle = "gb-t-7714-numeric"
 	}
 	for key, st := range c.Profiles {
 		mode := strings.ToLower(strings.TrimSpace(st.Mode))
@@ -319,19 +332,8 @@ func NormalizeCitation(c *CitationConfig) {
 			seen[f] = true
 			fields = append(fields, f)
 		}
-		styleID := strings.TrimSpace(st.ReferenceStyle)
-		if styleID == "" {
-			styleID = strings.TrimSpace(c.ReferenceStyle)
-		}
-		if styleID == "" {
-			styleID = "gb-t-7714-numeric"
-		}
+		// 悬浮模式链接固定第一项；允许全部取消勾选。
 		if mode == "markdown" {
-			// v5：旧配置补“链接”；悬浮模式下链接固定第一项。
-			if c.Version < 5 && !seen["link"] {
-				fields = append([]string{"link"}, fields...)
-				seen["link"] = true
-			}
 			ordered := make([]string, 0, len(fields))
 			if seen["link"] {
 				ordered = append(ordered, "link")
@@ -342,15 +344,12 @@ func NormalizeCitation(c *CitationConfig) {
 				}
 			}
 			fields = ordered
-			// v5 允许全部取消勾选：此时正文只显示 [1]，不再回填默认字段。
-			if len(fields) == 0 && c.Version < 5 {
-				fields = append(fields, defaultCitationFields...)
-			}
+		}
+		styleID := strings.TrimSpace(st.ReferenceStyle)
+		if styleID == "" {
+			styleID = defaultStyle
 		}
 		c.Profiles[key] = CitationStyle{Mode: mode, Fields: fields, ReferenceStyle: styleID}
-	}
-	if c.Version < 5 {
-		c.Version = 5
 	}
 }
 
@@ -368,9 +367,11 @@ func (c CitationConfig) Style(profile string) CitationStyle {
 		st.Mode = "markdown"
 	}
 	if strings.TrimSpace(st.ReferenceStyle) == "" {
-		st.ReferenceStyle = strings.TrimSpace(c.ReferenceStyle)
+		if def, ok := c.Profiles["default"]; ok {
+			st.ReferenceStyle = strings.TrimSpace(def.ReferenceStyle)
+		}
 	}
-	if st.ReferenceStyle == "" {
+	if strings.TrimSpace(st.ReferenceStyle) == "" {
 		st.ReferenceStyle = "gb-t-7714-numeric"
 	}
 	return st
@@ -416,13 +417,13 @@ func Default() Config {
 			},
 			Dim: 1536,
 		},
-		Citation: CitationConfig{Version: 5, ReferenceStyle: "gb-t-7714-numeric", Profiles: defaultCitationProfiles()},
+		Citation: CitationConfig{Profiles: defaultCitationProfiles()},
 		Zotero: ZoteroConfig{
 			Enabled:       false,
 			DataDir:       DefaultZoteroDataDir(),
 			APIBase:       "http://127.0.0.1:23119/api",
 			LibraryID:     "0",
-			MDMode:        "storage",
+			MDMode:        "item",
 			ParseMode:     "auto",
 			CiteStyle:     "gb-t-7714-numeric",
 			Watch:         true,
@@ -456,18 +457,6 @@ func Load(path string) (Config, string, error) {
 		b = []byte(os.ExpandEnv(string(b)))
 		if err := toml.Unmarshal(b, &cfg); err != nil {
 			return cfg, resolved, fmt.Errorf("解析配置 %s: %w", resolved, err)
-		}
-		// 旧配置没有 [citation].style 时，沿用 [zotero].cite_style。
-		var file struct {
-			Citation struct {
-				Style *string `toml:"style"`
-			} `toml:"citation"`
-		}
-		_ = toml.Unmarshal(b, &file)
-		if file.Citation.Style == nil || strings.TrimSpace(*file.Citation.Style) == "" {
-			if zs := strings.TrimSpace(cfg.Zotero.CiteStyle); zs != "" {
-				cfg.Citation.ReferenceStyle = zs
-			}
 		}
 	}
 
@@ -716,10 +705,6 @@ func normalizeKeys(e *Endpoint) {
 
 // fill 兜底：确保关键字段非空且取值在合理范围。
 func fill(c *Config) {
-	// 旧配置把参考文献格式放在 [zotero].cite_style；迁移到 [citation].style。
-	if strings.TrimSpace(c.Citation.ReferenceStyle) == "" && strings.TrimSpace(c.Zotero.CiteStyle) != "" {
-		c.Citation.ReferenceStyle = c.Zotero.CiteStyle
-	}
 	NormalizeCitation(&c.Citation)
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8765"

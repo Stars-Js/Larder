@@ -505,9 +505,11 @@
 
   async function saveZoteroSettings(patch) {
     const cur = await api("/api/zotero/settings");
+    // GET 会返回只读状态字段；PUT 只回传可写设置，避免后端严格解码报 unknown field。
+    const { local_api_key, write_authorized, key_masked, ...writable } = cur || {};
     return api("/api/zotero/settings", {
       method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...cur, ...patch }),
+      body: JSON.stringify({ ...writable, ...patch }),
     });
   }
 
@@ -548,10 +550,11 @@
           <option value="zotero" ${s.parse_mode === "zotero" ? "selected" : ""}>只用 Zotero 全文缓存（快，无图片）</option>
         </select></div>
         <div class="field"><label>解析后 MD</label><select class="input" id="zsMd">
-          <option value="storage" ${s.md_mode === "storage" ? "selected" : ""}>PDF 同目录（storage）</option>
-          <option value="larder" ${s.md_mode === "larder" ? "selected" : ""}>Zotero/larder-md</option>
-          <option value="off" ${s.md_mode === "off" ? "selected" : ""}>不写文件</option>
-        </select></div>
+          <option value="item" ${s.md_mode === "item" || s.md_mode === "storage" ? "selected" : ""}>同词条下（Zotero 子附件）</option>
+          <option value="larder" ${s.md_mode === "larder" ? "selected" : ""}>Zotero/larder 文件夹</option>
+          <option value="off" ${s.md_mode === "off" ? "selected" : ""}>不保存</option>
+        </select>
+        <span class="hint">“同词条下”会在 Zotero 词条下创建 Markdown 子附件，需要先在文献库页完成本地写入授权；图片放在 Markdown 同目录的 image/。</span></div>
       </div>`,
       actions: `<button class="btn" data-act="cancel">取消</button><button class="btn primary" data-act="ok">保存</button>`,
     });
@@ -632,13 +635,21 @@
                 自动读取：${esc(status.detected_data_dir || "未检测到，请手动填写")} · 本地 API：${esc(zcfg.api_base || "")}${status.api_error ? "（" + esc(status.api_error) + "）" : ""}
               </div>
             </div>
+            <div class="field"><label>Zotero 本地写入</label>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <span class="chip ${zcfg.write_authorized ? "ok" : ""}" id="zWriteState">${zcfg.write_authorized ? "已授权" : "未授权"}</span>
+                <button class="btn sm" id="btnZAuthorize">授权写入 Zotero</button>
+                <button class="btn ghost sm" id="btnZRevoke" ${zcfg.write_authorized ? "" : "hidden"}>取消授权</button>
+              </div>
+              <div class="hint" style="margin-top:6px">“同词条下”需要在 Zotero 10+ 中创建子附件。点授权后在 Zotero 弹窗选择“始终允许”；未授权时 Markdown 仍会写进 PDF 同目录，但不会出现在词条下。</div>
+            </div>
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
               <div class="field"><label>新文献库名称</label><input class="input" id="zName" placeholder="留空则使用集合名"></div>
               <div class="field"><label>解析后 MD</label>
                 <select class="input" id="zMdMode">
-                  <option value="storage" ${zcfg.md_mode === "storage" ? "selected" : ""}>PDF 同目录（storage）</option>
-                  <option value="larder" ${zcfg.md_mode === "larder" ? "selected" : ""}>Zotero/larder-md</option>
-                  <option value="off" ${zcfg.md_mode === "off" ? "selected" : ""}>不写文件</option>
+                  <option value="item" ${zcfg.md_mode === "item" || zcfg.md_mode === "storage" ? "selected" : ""}>同词条下（Zotero 子附件）</option>
+                  <option value="larder" ${zcfg.md_mode === "larder" ? "selected" : ""}>Zotero/larder 文件夹</option>
+                  <option value="off" ${zcfg.md_mode === "off" ? "selected" : ""}>不保存</option>
                 </select>
               </div>
               <div class="field"><label>解析来源</label>
@@ -719,6 +730,54 @@
       finally { btn.disabled = false; }
     };
 
+    $("#btnZAuthorize").onclick = async () => {
+      const btn = $("#btnZAuthorize");
+      btn.disabled = true;
+      btn.textContent = "等待 Zotero 授权…";
+      try {
+        const r = await api("/api/zotero/authorize-write", { method: "POST" });
+        if (!r.remember) {
+          // “允许一次”的密钥只能用于一次写入，无法批量补挂；提示重新选择“始终允许”。
+          try { await api("/api/zotero/authorize-write", { method: "DELETE" }); } catch {}
+          $("#zWriteState").textContent = "未授权";
+          $("#zWriteState").classList.remove("ok");
+          $("#btnZRevoke").hidden = true;
+          toast("你选择了“允许一次”。请重新点授权，并在 Zotero 弹窗选择“始终允许”，否则无法批量挂载。", "err");
+          return;
+        }
+        $("#zWriteState").textContent = "已授权";
+        $("#zWriteState").classList.add("ok");
+        $("#btnZRevoke").hidden = false;
+        toast(r.message || "已授权 Zotero 本地写入", "ok");
+        // 授权后立即把已有解析 Markdown 补挂到词条下。
+        let repaired = 0, created = 0, failed = 0, expired = false;
+        for (const k of kbs) {
+          try {
+            const rr = await api(`/api/kbs/${encodeURIComponent(k.id)}/zotero/repair-attachments`, { method: "POST" });
+            repaired += (rr.linked || 0) + (rr.created || 0);
+            created += rr.created || 0;
+            failed += rr.failed || 0;
+            if (rr.message) toast(rr.message, "err");
+            if (rr.auth_expired) expired = true;
+          } catch (err) { failed++; }
+        }
+        if (expired) {
+          $("#zWriteState").textContent = "授权已失效";
+          $("#zWriteState").classList.remove("ok");
+          $("#btnZRevoke").hidden = true;
+        } else if (repaired || created) toast(`已处理 ${repaired} 个词条附件（新建 ${created}）`, failed ? "err" : "ok");
+      } catch (err) { toast(err.message, "err"); }
+      finally { btn.disabled = false; btn.textContent = "授权写入 Zotero"; }
+    };
+    $("#btnZRevoke").onclick = async () => {
+      try {
+        await api("/api/zotero/authorize-write", { method: "DELETE" });
+        $("#zWriteState").textContent = "未授权";
+        $("#zWriteState").classList.remove("ok");
+        $("#btnZRevoke").hidden = true;
+        toast("已取消 Zotero 本地写入授权", "ok");
+      } catch (err) { toast(err.message, "err"); }
+    };
     $("#btnZCreate").onclick = async () => {
       const picked = $("input[name=zCollection]:checked");
       if (!picked) { toast("请先选择一个 Zotero 集合", "err"); return; }
@@ -1140,6 +1199,7 @@
         <div class="preview-actions">
           <a class="btn sm" href="${fileURL}" target="_blank" rel="noreferrer">在新标签打开</a>
           <a class="btn sm" href="${fileURL}?download=1">下载原文件</a>
+          ${doc.origin_type !== "url" ? `<button class="btn sm" id="btnOpenFileDir">打开文件目录</button>` : ""}
         </div>
         ${isPdf
           ? `<iframe class="pdf-frame" data-src="${fileURL}" title="PDF 原文"></iframe>`
@@ -1159,13 +1219,15 @@
       <div class="tab-pane" data-ppane="md">
         <div class="preview-actions">
           <button class="btn sm" id="btnCopyMd">复制 Markdown</button>
-          <button class="btn sm" id="btnExportMd">导出 .md</button>
+          <button class="btn sm" id="btnExportMd">导出 Markdown + image</button>
+          ${data.has_md ? `<button class="btn sm" id="btnOpenMdDir">打开解析目录</button>` : ""}
         </div>
         <pre class="md-box" id="mdBox">${esc(md || "（没有可显示的 Markdown）")}</pre>
       </div>
       <div class="tab-pane" data-ppane="render" hidden>
         <div class="preview-actions">
-          <button class="btn sm" id="btnExportMd2">导出 .md</button>
+          <button class="btn sm" id="btnExportMd2">导出 Markdown + image</button>
+          ${data.has_md ? `<button class="btn sm" id="btnOpenMdDir2">打开解析目录</button>` : ""}
         </div>
         <div class="md-render">${rendered || "<p>（没有可渲染的内容）</p>"}</div>
       </div>
@@ -1198,10 +1260,26 @@
 
     const copyBtn = m.el.querySelector("#btnCopyMd");
     if (copyBtn) copyBtn.onclick = () => copyText(md);
+    const exportZip = `/api/kbs/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}/export.zip`;
     const exp1 = m.el.querySelector("#btnExportMd");
-    if (exp1) exp1.onclick = () => { downloadText(mdFileName(doc.title), md); toast("已导出 Markdown", "ok"); };
+    if (exp1) exp1.onclick = () => { window.location.href = exportZip; toast("正在导出 Markdown + image/", "ok"); };
     const exp2 = m.el.querySelector("#btnExportMd2");
-    if (exp2) exp2.onclick = () => { downloadText(mdFileName(doc.title), md); toast("已导出 Markdown", "ok"); };
+    if (exp2) exp2.onclick = () => { window.location.href = exportZip; toast("正在导出 Markdown + image/", "ok"); };
+    const openDir = async (kind) => {
+      try {
+        const r = await api(`/api/kbs/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}/open-folder`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind }),
+        });
+        toast("已打开：" + (r.path || ""), "ok");
+      } catch (err) { toast(err.message, "err"); }
+    };
+    const openMd = m.el.querySelector("#btnOpenMdDir");
+    if (openMd) openMd.onclick = () => openDir("md");
+    const openMd2 = m.el.querySelector("#btnOpenMdDir2");
+    if (openMd2) openMd2.onclick = () => openDir("md");
+    const openFile = m.el.querySelector("#btnOpenFileDir");
+    if (openFile) openFile.onclick = () => openDir("pdf");
 
     m.el.querySelector("[data-act=del]").onclick = () => {
       m.close();
@@ -1272,6 +1350,7 @@
         <div style="display:flex;gap:8px">
           <a class="btn sm" href="/api/kbs/${encodeURIComponent(info.id)}/bibliography.bib" target="_blank" rel="noreferrer">导出 .bib</a>
           <button class="btn sm" id="btnZoteroSettings">引用设置</button>
+          <button class="btn sm" id="btnZoteroRepair" title="把已有解析 Markdown 挂到对应 Zotero 词条下，并清理重复图片">修复词条附件</button>
           <button class="btn sm" id="btnZoteroForce" title="忽略 dateModified，重新解析全部条目（用于切换版面解析后刷新）">强制重解析</button>
           <button class="btn primary sm" id="btnZoteroSync">同步 Zotero</button>
         </div>
@@ -1318,6 +1397,17 @@
       $("#btnZoteroSync").onclick = () => syncZoteroKb(id, $("#zoteroJob"));
       $("#btnZoteroForce").onclick = () => syncZoteroKb(id, $("#zoteroJob"), true);
       $("#btnZoteroSettings").onclick = () => openZoteroSettings(id);
+      $("#btnZoteroRepair").onclick = async () => {
+        const btn = $("#btnZoteroRepair");
+        btn.disabled = true;
+        btn.textContent = "修复中…";
+        try {
+          const r = await api(`/api/kbs/${encodeURIComponent(id)}/zotero/repair-attachments`, { method: "POST" });
+          toast(r.message || `修复完成：新建 ${r.created || 0}，已存在 ${r.linked || 0}，跳过 ${r.skipped || 0}，失败 ${r.failed || 0}`, r.failed ? "err" : "ok");
+          if (r.errors && r.errors.length) console.warn("Zotero 附件修复失败", r.errors);
+        } catch (err) { toast(err.message, "err"); }
+        finally { btn.disabled = false; btn.textContent = "修复词条附件"; }
+      };
       pollZoteroJob(id, $("#zoteroJob"));
     }
   });
@@ -1794,6 +1884,9 @@
   let settingsSavePromise = null;
   let settingsSaving = false;
   let settingsDirty = false;
+  let citationSaveTimer = null;
+  let citationSaving = false;
+  let citationDirty = false;
   let citationProfiles = {};
   let citationPlatforms = [];
   let citationProfile = localStorage.getItem("larder.citationProfile") || "default";
@@ -1811,6 +1904,7 @@
     { id: "text", label: "原文", sample: "ATE 0.203 m，等价性检验 p = 0.35…" },
   ];
   const CITE_DEFAULT_FIELDS = ["link", "reference", "file", "text"];
+  const CITE_NUMERIC_STYLES = new Set(["gb-t-7714-numeric", "ieee", "vancouver"]);
 
   function defaultCiteStyle() {
     return { mode: "markdown", fields: CITE_DEFAULT_FIELDS.slice(), style: "gb-t-7714-numeric" };
@@ -1870,6 +1964,9 @@
     const preview = citationPreviewCache.get(style) || CITE_PREVIEW_FALLBACK;
     const mark = preview.mark || "[1]";
     const reference = preview.reference_line || preview.reference || "";
+    const bodyHTML = st.mode === "markdown" && CITE_NUMERIC_STYLES.has(style)
+      ? `<sup>${esc(mark)}</sup>`
+      : esc(mark);
     if (st.mode === "markdown") {
       const title = st.fields
         .filter((id) => id !== "link")
@@ -1883,10 +1980,10 @@
       } else if (!title) {
         hover = "（未勾选显示内容，悬停没有内容）";
       }
-      return { mode: "markdown", body: mark, hover, reference, style };
+      return { mode: "markdown", body: mark, bodyHTML, hover, reference, style };
     }
     // 纯文本只输出参考文献标准规定的文内标记，不附加任何自定义字段。
-    return { mode: "plain", body: mark, hover: "", reference, style };
+    return { mode: "plain", body: mark, bodyHTML, hover: "", reference, style };
   }
 
   function renderCitationEditor() {
@@ -1932,13 +2029,13 @@
           <button class="btn sm ${isHover ? "primary" : ""}" data-cite-mode="markdown" ${citationProfile === "zcode" ? "disabled" : ""}>悬浮链接</button>
           <button class="btn sm ${!isHover ? "primary" : ""}" data-cite-mode="plain">纯文本</button>
         </div>
-        <span class="hint">${citationProfile === "zcode" ? "ZCode 会移除 Markdown 链接，因此固定使用纯文本引用。" : `悬浮链接：正文显示文内引用标记；勾选「链接」后，悬停按下面顺序显示悬浮内容。纯文本：按参考文献格式只输出文内标记和文末参考文献，页面下方不提供悬浮内容设置。`}</span>
+        <span class="hint">${citationProfile === "zcode" ? "ZCode 会移除 Markdown 链接，因此固定使用纯文本引用。" : `悬浮链接：正文显示上标引用标记；勾选「链接」后，悬停按下面顺序显示悬浮内容。纯文本：按参考文献格式只输出文内标记和文末参考文献，页面下方不提供悬浮内容设置。`}</span>
       </div>
       ${fieldsHTML}
       <div class="field" style="margin-top:12px">
         <label>预览</label>
         <div class="cite-preview-label">正文预览</div>
-        <pre class="cite-preview">${esc(previews.body)}</pre>
+        <pre class="cite-preview">${previews.bodyHTML}</pre>
         ${isHover ? `
         <div class="cite-preview-label" style="margin-top:10px">悬浮预览</div>
         <pre class="cite-preview">${esc(previews.hover)}</pre>` : ""}
@@ -1994,8 +2091,43 @@
   }
 
   function markCitationDirty() {
-    settingsDirty = true;
-    scheduleSettingsSave(250);
+    citationDirty = true;
+    setSaveState("修改后自动保存…", "saving");
+    if (citationSaveTimer) clearTimeout(citationSaveTimer);
+    citationSaveTimer = setTimeout(() => {
+      citationSaveTimer = null;
+      saveCitationNow();
+    }, 60);
+  }
+
+  async function saveCitationNow() {
+    if (citationSaving) return;
+    citationSaving = true;
+    try {
+      while (citationDirty) {
+        citationDirty = false;
+        try {
+          const res = await api("/api/citation", {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ profiles: citationProfiles }),
+          });
+          if (settingsCache) settingsCache.citation = res;
+          setSaveState("已自动保存 · " + new Date().toLocaleTimeString(), "ok");
+        } catch (err) {
+          citationDirty = true;
+          setSaveState("保存失败：" + err.message, "err");
+          break;
+        }
+      }
+    } finally {
+      citationSaving = false;
+      if (citationDirty && !citationSaveTimer) {
+        citationSaveTimer = setTimeout(() => {
+          citationSaveTimer = null;
+          saveCitationNow();
+        }, 1200);
+      }
+    }
   }
 
   function renderCitationPlatforms() {
@@ -2019,7 +2151,7 @@
       { id: "claude-desktop", name: "Claude Desktop" }, { id: "claude-code", name: "Claude Code" },
       { id: "cursor", name: "Cursor" }, { id: "dsh", name: "DSH" },
     ];
-    const fallbackStyle = (s.citation && s.citation.style) || (s.zotero && s.zotero.cite_style) || "gb-t-7714-numeric";
+    const fallbackStyle = (s.citation && s.citation.profiles && s.citation.profiles.default && s.citation.profiles.default.style) || (s.citation && s.citation.style) || (s.zotero && s.zotero.cite_style) || "gb-t-7714-numeric";
     citationProfiles = normalizeCitationProfiles(s.citation && s.citation.profiles, fallbackStyle);
     if (!citationProfiles[citationProfile]) citationProfile = "default";
     renderCitationPlatforms();
