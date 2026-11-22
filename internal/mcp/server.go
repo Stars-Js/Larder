@@ -1628,11 +1628,19 @@ func (s *Server) referencesForHits(ctx context.Context, kbID string, hits []mode
 }
 
 func paperFileName(item model.LibraryItem, h model.SearchHit) string {
-	name := filepath.Base(strings.TrimSpace(item.AttachmentPath))
-	if name == "" || name == "." || name == string(filepath.Separator) {
-		name = filepath.Base(strings.TrimSpace(h.Source))
+	name := crossPlatformBase(strings.TrimSpace(item.AttachmentPath))
+	if name == "" || name == "." {
+		name = crossPlatformBase(strings.TrimSpace(h.Source))
 	}
 	return name
+}
+
+func crossPlatformBase(path string) string {
+	path = strings.TrimRight(path, `/\`)
+	if i := strings.LastIndexAny(path, `/\`); i >= 0 {
+		path = path[i+1:]
+	}
+	return path
 }
 
 func paperExcerpt(h model.SearchHit) string {
